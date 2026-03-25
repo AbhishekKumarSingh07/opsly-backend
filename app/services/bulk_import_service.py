@@ -158,8 +158,16 @@ class BulkImportService:
                 # Policy: moderators cannot import non-staff roles
                 PermissionPolicy(actor).require_can_create_user(row.role)
 
-                if self.user_repo.get_by_email(row.email):
-                    raise ValueError(f"Email '{row.email}' is already registered.")
+                existing_user = self.user_repo.get_by_email(row.email)
+                if existing_user:
+                    # Update existing user instead of failing
+                    existing_user.name = row.name
+                    existing_user.phone = row.phone
+                    existing_user.role = row.role
+                    self.db.flush()
+                    success += 1
+                    logger.info("Bulk import: updated existing user %s (row %d)", row.email, idx)
+                    continue
 
                 temp_password = _generate_temp_password()
                 user = User(
@@ -201,10 +209,25 @@ class BulkImportService:
             try:
                 row = InventoryImportRow.model_validate(row_data)
 
-                if row.barcode and self.inv_repo.get_by_barcode(row.barcode):
-                    raise ValueError(f"Barcode '{row.barcode}' already exists.")
-                if row.serial_no and self.inv_repo.get_by_serial(row.serial_no):
-                    raise ValueError(f"Serial number '{row.serial_no}' already exists.")
+                existing: InventoryItem | None = None
+                if row.barcode:
+                    existing = self.inv_repo.get_by_barcode(row.barcode)
+                if existing is None and row.serial_no:
+                    existing = self.inv_repo.get_by_serial(row.serial_no)
+
+                if existing is not None:
+                    # Update the existing item instead of failing
+                    existing.part_name = row.part_name
+                    existing.part_number = row.part_number
+                    existing.description = row.description
+                    existing.unit_cost = row.unit_cost
+                    self.db.flush()
+                    success += 1
+                    logger.info(
+                        "Bulk import: updated existing inventory item %s (row %d)",
+                        row.part_number, idx,
+                    )
+                    continue
 
                 item = InventoryItem(
                     part_name=row.part_name,

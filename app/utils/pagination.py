@@ -18,13 +18,13 @@ def paginate(items: list[T], total: int, page: int, page_size: int) -> Paginated
         page: Current 1-based page number.
         page_size: Number of records per page.
     """
-    pages = math.ceil(total / page_size) if page_size > 0 else 0
+    total_pages = math.ceil(total / page_size) if page_size > 0 else 0
     return PaginatedResponse(
+        data=items,
         total=total,
         page=page,
         page_size=page_size,
-        pages=pages,
-        items=items,
+        total_pages=total_pages,
     )
 
 

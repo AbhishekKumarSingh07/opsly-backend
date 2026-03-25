@@ -67,6 +67,72 @@ async def import_inventory(
     return log
 
 
+# ── Static GET routes MUST come before /{import_id} to avoid route shadowing ──
+
+@router.get("/format-reference", include_in_schema=True)
+def format_reference(
+    current_user=Depends(require_role("owner", "moderator")),
+):
+    """
+    Return the expected format specification for all import types.
+
+    Use this in the UI to show users the column names, types, and rules before
+    they upload a file — regardless of whether they choose Excel, CSV, or JSON.
+
+    Accessible by: owner, moderator.
+    """
+    return {
+        "staff": [
+            {"column": "name",  "type": "string",  "required": True,  "notes": "Full name of the staff member"},
+            {"column": "email", "type": "string",  "required": True,  "notes": "Must be a valid email, globally unique"},
+            {"column": "phone", "type": "string",  "required": False, "notes": "10-digit mobile number"},
+            {"column": "role",  "type": "enum",    "required": True,  "notes": "Allowed: staff (moderators cannot use moderator/owner)"},
+        ],
+        "inventory": [
+            {"column": "part_name",   "type": "string",  "required": True,  "notes": "Descriptive name of the part"},
+            {"column": "part_number", "type": "string",  "required": True,  "notes": "Internal part number"},
+            {"column": "serial_no",   "type": "string",  "required": False, "notes": "Must be globally unique if provided"},
+            {"column": "barcode",     "type": "string",  "required": False, "notes": "Must be globally unique if provided"},
+            {"column": "description", "type": "string",  "required": False, "notes": "Optional free-text description"},
+            {"column": "unit_cost",   "type": "decimal", "required": False, "notes": "Cost in INR, defaults to 0.00"},
+        ],
+    }
+
+
+@router.get("/templates/staff", response_class=PlainTextResponse)
+def download_staff_template(
+    current_user=Depends(require_role("owner", "moderator")),
+):
+    """
+    Download the CSV template for staff imports.
+
+    Includes column headers, an example row, and instructions.
+    Accessible by: owner, moderator.
+    """
+    return PlainTextResponse(
+        content=BulkImportService.get_staff_template_csv(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=staff_import_template.csv"},
+    )
+
+
+@router.get("/templates/inventory", response_class=PlainTextResponse)
+def download_inventory_template(
+    current_user=Depends(require_role("owner", "moderator")),
+):
+    """
+    Download the CSV template for inventory imports.
+
+    Includes column headers, an example row, and instructions.
+    Accessible by: owner, moderator.
+    """
+    return PlainTextResponse(
+        content=BulkImportService.get_inventory_template_csv(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=inventory_import_template.csv"},
+    )
+
+
 @router.get("/", response_model=list[BulkImportSummary])
 def list_import_history(
     skip: int = 0,
@@ -111,79 +177,3 @@ def get_import_detail(
     if current_user.role != UserRole.owner and log.imported_by != current_user.id:
         raise NotFoundError("BulkImportLog", str(import_id))  # 404 — do not reveal existence
     return log
-
-
-@router.get("/templates/staff", response_class=PlainTextResponse)
-def download_staff_template(
-    current_user=Depends(require_role("owner", "moderator")),
-):
-    """
-    Download the CSV template for staff imports.
-
-    Includes column headers, an example row, and instructions.
-    Accessible by: owner, moderator.
-    """
-    return PlainTextResponse(
-        content=BulkImportService.get_staff_template_csv(),
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=staff_import_template.csv"},
-    )
-
-
-@router.get("/templates/inventory", response_class=PlainTextResponse)
-def download_inventory_template(
-    current_user=Depends(require_role("owner", "moderator")),
-):
-    """
-    Download the CSV template for inventory imports.
-
-    Includes column headers, an example row, and instructions.
-    Accessible by: owner, moderator.
-    """
-    return PlainTextResponse(
-        content=BulkImportService.get_inventory_template_csv(),
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=inventory_import_template.csv"},
-    )
-
-
-@router.get("/format-reference", include_in_schema=True)
-def format_reference(
-    current_user=Depends(require_role("owner", "moderator")),
-):
-    """
-    Return the expected format specification for all import types.
-
-    Use this in the UI to show users the column names, types, and rules before
-    they upload a file — regardless of whether they choose Excel, CSV, or JSON.
-
-    Accessible by: owner, moderator.
-    """
-    return {
-        "staff": {
-            "columns": [
-                {"name": "name",  "type": "string",  "required": True,  "notes": "Full name of the staff member"},
-                {"name": "email", "type": "string",  "required": True,  "notes": "Must be a valid email, globally unique"},
-                {"name": "phone", "type": "string",  "required": False, "notes": "10-digit mobile number"},
-                {"name": "role",  "type": "enum",    "required": True,  "notes": "Allowed values: staff (moderators cannot set moderator/owner)"},
-            ],
-            "notes": (
-                "A temporary password is auto-generated for each user. "
-                "Users must change it on first login. "
-                "Moderators can only create staff-role accounts."
-            ),
-            "example_row": {"name": "Ravi Kumar", "email": "ravi@example.com", "phone": "9876543210", "role": "staff"},
-        },
-        "inventory": {
-            "columns": [
-                {"name": "part_name",   "type": "string",  "required": True,  "notes": "Descriptive name of the part"},
-                {"name": "part_number", "type": "string",  "required": True,  "notes": "Internal part number"},
-                {"name": "serial_no",   "type": "string",  "required": False, "notes": "Must be globally unique if provided"},
-                {"name": "barcode",     "type": "string",  "required": False, "notes": "Must be globally unique if provided"},
-                {"name": "description", "type": "string",  "required": False, "notes": "Optional free-text description"},
-                {"name": "unit_cost",   "type": "decimal", "required": False, "notes": "Cost in INR, defaults to 0.00"},
-            ],
-            "notes": "Rows with duplicate barcodes or serial numbers are rejected with a clear error.",
-            "example_row": {"part_name": "AVR Module", "part_number": "AVR-001", "barcode": "BC001", "unit_cost": "1500.00"},
-        },
-    }

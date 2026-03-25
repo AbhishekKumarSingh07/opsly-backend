@@ -11,6 +11,7 @@ from app.models.tender import Tender, TenderStatus, TenderMilestone, TenderDocum
 from app.models.expense import Expense, ExpenseStatus
 from app.models.client import Client
 from app.models.audit_log import AuditLog, AuditAction
+from app.models.bulk_import import BulkImportLog, ImportType, ImportFormat, ImportStatus
 
 __all__ = [
     "User", "UserRole",

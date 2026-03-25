@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.core.dependencies import get_current_user, get_db, require_role
 from app.repositories.inventory_repo import InventoryRepository
+from app.schemas.common import PaginatedResponse
 from app.schemas.inventory import (
     InventoryCheckoutSchema,
     InventoryIntakeSchema,
@@ -14,6 +15,7 @@ from app.schemas.inventory import (
     InventoryReturnSchema,
 )
 from app.services.inventory_service import InventoryService
+from app.utils.pagination import paginate
 
 router = APIRouter(prefix="/inventory", tags=["Inventory"])
 
@@ -81,19 +83,27 @@ def receive_return(
     return service.receive_returned_part(payload.barcode, current_user, payload.notes)
 
 
-@router.get("/", response_model=list[InventoryItemResponse], dependencies=[Depends(require_role("owner", "moderator"))])
+@router.get("/", response_model=PaginatedResponse[InventoryItemResponse], dependencies=[Depends(require_role("owner", "moderator"))])
 def list_inventory(
-    skip: int = 0,
-    limit: int = 50,
+    page: int = 1,
+    page_size: int = 20,
     db: Session = Depends(get_db),
 ):
     """
-    List all inventory items.
+    List all inventory items (paginated).
 
     - Accessible by: owner, moderator.
     """
     repo = InventoryRepository(db)
-    return repo.list_all(skip=skip, limit=limit)
+    skip = (page - 1) * page_size
+    items = repo.list_all(skip=skip, limit=page_size)
+    total = repo.count()
+    return paginate(
+        [InventoryItemResponse.model_validate(i) for i in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @router.get("/{item_id}", response_model=InventoryItemResponse, dependencies=[Depends(require_role("owner", "moderator"))])

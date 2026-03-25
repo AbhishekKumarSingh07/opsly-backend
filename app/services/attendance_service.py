@@ -6,15 +6,13 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
 from app.core.exceptions import BusinessRuleError, ConflictError, NotFoundError, PermissionDeniedError
 from app.core.permissions import PermissionPolicy
 from app.models.attendance import Attendance, AttendanceStatus
 from app.models.user import User, UserRole
 from app.repositories.attendance_repo import AttendanceRepository
 from app.repositories.ticket_repo import TicketRepository
-from app.schemas.attendance import AttendancePunchInSchema, AttendancePunchOutSchema
-from app.utils.geo import is_within_radius
+from app.schemas.attendance import AttendancePunchInSchema, AttendancePunchOutSchema, AttendanceAdminAddSchema
 
 logger = logging.getLogger("opsly.attendance")
 
@@ -32,11 +30,12 @@ class AttendanceService:
 
         Rules:
         - One punch-in per user per calendar day.
-        - GPS is validated using Haversine formula.
-          Staff → validated against ticket site GPS (ticket_id required).
-          Moderator/Owner → validated against office GPS from settings.
-        - If outside radius: record is FLAGGED (not rejected).
-        - Liveness score < 0.7 → FLAGGED.
+        - GPS coordinates are recorded silently in the background; no
+          geofence error is raised and no flag is set automatically.
+        - The record is always created as PENDING_APPROVAL and must be
+          approved (or flagged) by a moderator or owner.
+        - ticket_id is optional for all roles; GPS location alone is
+          sufficient. ticket_id can be linked later during approval.
         """
         from datetime import date
 
@@ -45,52 +44,15 @@ class AttendanceService:
         if existing:
             raise ConflictError("Attendance record already exists for today.")
 
-        # GPS geofence validation
-        flag_reason: str | None = None
-        status = AttendanceStatus.PENDING_APPROVAL
-
-        if user.role == UserRole.staff:
-            if not payload.ticket_id:
-                raise BusinessRuleError(
-                    "TICKET_REQUIRED",
-                    "staff must provide ticket_id for punch-in GPS validation.",
-                )
+        # If a ticket_id is provided by any role, validate it exists.
+        # ticket_id is optional — GPS coordinates are sufficient for
+        # attendance submission; association with a ticket can be done
+        # later by a moderator/owner during approval.
+        if payload.ticket_id:
             ticket_repo = TicketRepository(self.db)
             ticket = ticket_repo.get_by_id(payload.ticket_id)
             if not ticket:
                 raise NotFoundError("Ticket", str(payload.ticket_id))
-
-            dg_set = ticket.dg_set
-            site = dg_set.site if dg_set else None
-            if site and site.gps_lat is not None and site.gps_lng is not None:
-                in_range = is_within_radius(
-                    payload.gps_lat, payload.gps_lng,
-                    site.gps_lat, site.gps_lng,
-                    settings.GEOFENCE_RADIUS_METERS,
-                )
-                if not in_range:
-                    flag_reason = "GPS_OUT_OF_RANGE"
-                    status = AttendanceStatus.FLAGGED
-                    logger.info("Punch-in flagged GPS_OUT_OF_RANGE for user %s", user.id)
-        else:
-            # Moderator / Owner → office geofence
-            in_range = is_within_radius(
-                payload.gps_lat, payload.gps_lng,
-                settings.OFFICE_GPS_LAT, settings.OFFICE_GPS_LNG,
-                settings.GEOFENCE_RADIUS_METERS,
-            )
-            if not in_range:
-                flag_reason = "GPS_OUT_OF_RANGE"
-                status = AttendanceStatus.FLAGGED
-                logger.info("Punch-in flagged GPS_OUT_OF_RANGE for user %s", user.id)
-
-        # Liveness check
-        if payload.liveness_score < 0.7:
-            if flag_reason:
-                flag_reason = f"{flag_reason},LIVENESS_CHECK_FAILED"
-            else:
-                flag_reason = "LIVENESS_CHECK_FAILED"
-            status = AttendanceStatus.FLAGGED
 
         attendance = Attendance(
             user_id=user.id,
@@ -98,19 +60,15 @@ class AttendanceService:
             punch_in_time=datetime.now(timezone.utc),
             punch_in_gps_lat=payload.gps_lat,
             punch_in_gps_lng=payload.gps_lng,
-            selfie_url=payload.selfie_url,
-            liveness_score=payload.liveness_score,
             ticket_id=payload.ticket_id,
-            status=status,
-            flag_reason=flag_reason,
+            status=AttendanceStatus.PENDING_APPROVAL,
         )
 
-        result = self.repo.create(attendance)
-
-        if status == AttendanceStatus.FLAGGED:
-            self._notify_moderators_flagged(user, flag_reason or "")
-
-        return result
+        logger.info(
+            "Punch-in created for user %s at (%.5f, %.5f) — awaiting approval",
+            user.id, payload.gps_lat, payload.gps_lng,
+        )
+        return self.repo.create(attendance)
 
     def punch_out(self, user: User, payload: AttendancePunchOutSchema) -> Attendance:
         """Record punch-out time and GPS for today's open attendance record."""
@@ -173,7 +131,52 @@ class AttendanceService:
         record.flag_reason = reason
         return self.repo.save(record)
 
-    def _notify_moderators_flagged(self, user: User, reason: str) -> None:
-        """Stub: notify moderators of a flagged punch-in."""
-        from app.services.notification_service import NotificationService
-        NotificationService(self.db).notify_flagged_attendance(user, reason)
+    def admin_add_attendance(
+        self,
+        approver: User,
+        payload: AttendanceAdminAddSchema,
+    ) -> Attendance:
+        """
+        Moderator/Owner directly creates an approved attendance record for a staff member.
+
+        Rules:
+        - Moderators can only add records for staff users.
+        - Owner can add records for anyone.
+        - Duplicate date protection: raises ConflictError if a record already
+          exists for that user on that date.
+        - The record is immediately APPROVED with the caller as approver.
+        """
+        from app.repositories.user_repo import UserRepository
+
+        target_user = UserRepository(self.db).get_by_id(payload.user_id)
+        if not target_user:
+            raise NotFoundError("User", str(payload.user_id))
+
+        # Moderators may only add attendance for staff
+        PermissionPolicy(approver).require_can_approve_attendance(target_user)
+
+        existing = self.repo.get_today_record(payload.user_id, payload.date)
+        if existing:
+            raise ConflictError(
+                f"An attendance record for {target_user.name} on {payload.date} already exists."
+            )
+
+        attendance = Attendance(
+            user_id=payload.user_id,
+            date=payload.date,
+            punch_in_time=payload.punch_in_time,
+            punch_out_time=payload.punch_out_time,
+            punch_in_gps_lat=payload.gps_lat,
+            punch_in_gps_lng=payload.gps_lng,
+            ticket_id=payload.ticket_id,
+            status=AttendanceStatus.APPROVED,
+            approved_by=approver.id,
+            approved_at=datetime.now(timezone.utc),
+            approval_notes=payload.notes,
+        )
+
+        logger.info(
+            "Admin-added attendance for user %s on %s by %s",
+            payload.user_id, payload.date, approver.id,
+        )
+        return self.repo.create(attendance)

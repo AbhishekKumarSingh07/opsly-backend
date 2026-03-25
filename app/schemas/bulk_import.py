@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, EmailStr, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from app.models.bulk_import import ImportFormat, ImportStatus, ImportType
 from app.models.user import UserRole
@@ -17,9 +17,21 @@ class StaffImportRow(BaseModel):
     """One staff row from a bulk import file."""
 
     name: str
-    email: EmailStr
+    email: str
     phone: str | None = None
     role: UserRole = UserRole.staff
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def validate_email_format(cls, v: Any) -> str:
+        """Validate email syntax without checking deliverability (allows .local TLDs)."""
+        import re
+
+        if not isinstance(v, str) or not re.match(
+            r"^[^@\s]+@[^@\s]+\.[^@\s]+$", v.strip()
+        ):
+            raise ValueError(f"'{v}' is not a valid email address format")
+        return v.strip().lower()
 
     @field_validator("role", mode="before")
     @classmethod

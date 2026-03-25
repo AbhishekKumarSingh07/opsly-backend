@@ -53,6 +53,21 @@ class AttendanceRepository(BaseRepository[Attendance]):
             q = q.filter(Attendance.date <= to_date)
         return q.order_by(Attendance.date.desc()).offset(skip).limit(limit).all()
 
+    def list_for_month(self, year: int, month: int) -> list[Attendance]:
+        """Return all attendance records for a given calendar month, ordered by date then user."""
+        from calendar import monthrange
+        from sqlalchemy.orm import joinedload
+
+        first_day = date(year, month, 1)
+        last_day = date(year, month, monthrange(year, month)[1])
+        return (
+            self.db.query(Attendance)
+            .options(joinedload(Attendance.user))
+            .filter(Attendance.date >= first_day, Attendance.date <= last_day)
+            .order_by(Attendance.date, Attendance.user_id)
+            .all()
+        )
+
     def count_pending(self) -> int:
         return (
             self.db.query(Attendance)

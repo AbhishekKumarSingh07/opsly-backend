@@ -53,7 +53,7 @@ def create_user(
 @router.get("/", response_model=list[UserResponse])
 def list_users(
     skip: int = 0,
-    limit: int = 50,
+    limit: int = 1000,
     current_user: User = Depends(require_role("owner", "moderator")),
     db: Session = Depends(get_db),
 ):

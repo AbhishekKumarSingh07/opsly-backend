@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import enum
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import event, inspect
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import get_history  # type: ignore[attr-defined]
 
 from app.db.base import Base
 
@@ -20,6 +23,12 @@ def _get_model_state(instance) -> dict[str, Any]:
             val = str(val)
         elif isinstance(val, datetime):
             val = val.isoformat()
+        elif isinstance(val, date):
+            val = val.isoformat()
+        elif isinstance(val, enum.Enum):
+            val = val.value
+        elif isinstance(val, Decimal):
+            val = float(val)
         result[col.key] = val
     return result
 
@@ -86,9 +95,18 @@ def register_audit_listeners() -> None:
                 # Capture old values from identity map history
                 old_val: dict[str, Any] = {}
                 mapper = inspect(instance.__class__)
-                for attr in mapper.attrs:
-                    hist = attr.load_history()  # type: ignore[attr-defined]
+                for attr in mapper.column_attrs:
+                    hist = get_history(instance, attr.key)
                     if hist.deleted:
-                        old_val[attr.key] = hist.deleted[0]  # type: ignore[index]
+                        raw = hist.deleted[0]  # type: ignore[index]
+                        if isinstance(raw, uuid.UUID):
+                            raw = str(raw)
+                        elif isinstance(raw, datetime):
+                            raw = raw.isoformat()
+                        elif isinstance(raw, date):
+                            raw = raw.isoformat()
+                        elif isinstance(raw, enum.Enum):
+                            raw = raw.value
+                        old_val[attr.key] = raw
                 new_val = _get_model_state(instance)
                 _write_audit_log(session, table, record_id, "UPDATE", old_val, new_val)

@@ -11,9 +11,12 @@ from app.repositories.attendance_repo import AttendanceRepository
 from app.schemas.attendance import (
     AttendanceApproveSchema,
     AttendanceFlagSchema,
+    AttendanceAdminAddSchema,
     AttendancePunchInSchema,
     AttendancePunchOutSchema,
     AttendanceResponse,
+    AttendanceCalendarDay,
+    AttendanceCalendarEntry,
 )
 from app.services.attendance_service import AttendanceService
 
@@ -34,7 +37,8 @@ def punch_in(
     - Accessible by: staff, moderator, owner.
     """
     service = AttendanceService(db)
-    return service.punch_in(current_user, payload)
+    record = service.punch_in(current_user, payload)
+    return AttendanceResponse.from_orm_with_user(record)
 
 
 @router.post("/punch-out", response_model=AttendanceResponse)
@@ -49,7 +53,8 @@ def punch_out(
     - Accessible by: staff, moderator, owner.
     """
     service = AttendanceService(db)
-    return service.punch_out(current_user, payload)
+    record = service.punch_out(current_user, payload)
+    return AttendanceResponse.from_orm_with_user(record)
 
 
 @router.get("/pending", response_model=list[AttendanceResponse], dependencies=[Depends(require_role("owner", "moderator"))])
@@ -64,7 +69,8 @@ def pending_approvals(
     - Accessible by: owner, moderator.
     """
     repo = AttendanceRepository(db)
-    return repo.list_pending(skip=skip, limit=limit)
+    records = repo.list_pending(skip=skip, limit=limit)
+    return [AttendanceResponse.from_orm_with_user(r) for r in records]
 
 
 @router.patch("/{attendance_id}/approve", response_model=AttendanceResponse)
@@ -81,7 +87,8 @@ def approve_attendance(
     - Accessible by: owner, moderator.
     """
     service = AttendanceService(db)
-    return service.approve_attendance(attendance_id, current_user, payload.notes)
+    record = service.approve_attendance(attendance_id, current_user, payload.notes)
+    return AttendanceResponse.from_orm_with_user(record)
 
 
 @router.patch("/{attendance_id}/flag", response_model=AttendanceResponse)
@@ -98,7 +105,70 @@ def flag_attendance(
     - Accessible by: owner, moderator.
     """
     service = AttendanceService(db)
-    return service.flag_attendance(attendance_id, current_user, payload.reason)
+    record = service.flag_attendance(attendance_id, current_user, payload.reason)
+    return AttendanceResponse.from_orm_with_user(record)
+
+
+@router.post("/admin-add", response_model=AttendanceResponse)
+def admin_add_attendance(
+    payload: AttendanceAdminAddSchema,
+    current_user=Depends(require_role("owner", "moderator")),
+    db: Session = Depends(get_db),
+):
+    """
+    Directly create an approved attendance record for a staff member.
+
+    - No punch-in request is needed from the staff member.
+    - The record is immediately set to APPROVED; the caller's ID is recorded as approver.
+    - Moderators can only add records for staff users.
+    - Owner can add records for any user.
+    - Raises 409 if a record already exists for the user on that date.
+    - Accessible by: owner, moderator.
+    """
+    service = AttendanceService(db)
+    record = service.admin_add_attendance(current_user, payload)
+    return AttendanceResponse.from_orm_with_user(record)
+
+
+@router.get("/calendar", response_model=list[AttendanceCalendarDay], dependencies=[Depends(require_role("owner", "moderator"))])
+def attendance_calendar(
+    year: int = Query(..., ge=2020, le=2099, description="Calendar year, e.g. 2026"),
+    month: int = Query(..., ge=1, le=12, description="Calendar month 1–12"),
+    db: Session = Depends(get_db),
+):
+    """
+    Return all attendance records for a given month, grouped by date.
+
+    Each day lists every user who has a record on that date with their
+    name and attendance status — used to render the owner's calendar view.
+
+    Accessible by: owner, moderator.
+    """
+    from collections import defaultdict
+
+    repo = AttendanceRepository(db)
+    records = repo.list_for_month(year, month)
+
+    # Group by date
+    by_date: dict[date, list[AttendanceCalendarEntry]] = defaultdict(list)
+    for rec in records:
+        user = getattr(rec, "user", None)
+        user_name = getattr(user, "name", None) or "Unknown"
+        by_date[rec.date].append(
+            AttendanceCalendarEntry(
+                attendance_id=rec.id,
+                user_id=rec.user_id,
+                user_name=user_name,
+                status=rec.status,
+                punch_in_time=rec.punch_in_time,
+                punch_out_time=rec.punch_out_time,
+            )
+        )
+
+    return [
+        AttendanceCalendarDay(date=d, entries=entries)
+        for d, entries in sorted(by_date.items())
+    ]
 
 
 @router.get("/my", response_model=list[AttendanceResponse])
@@ -116,7 +186,8 @@ def my_attendance(
     - Accessible by: all roles.
     """
     repo = AttendanceRepository(db)
-    return repo.list_for_user(current_user.id, from_date, to_date, skip, limit)
+    records = repo.list_for_user(current_user.id, from_date, to_date, skip, limit)
+    return [AttendanceResponse.from_orm_with_user(r) for r in records]
 
 
 @router.get("/", response_model=list[AttendanceResponse], dependencies=[Depends(require_role("owner"))])
@@ -133,4 +204,5 @@ def all_attendance(
     - Accessible by: owner only.
     """
     repo = AttendanceRepository(db)
-    return repo.list_all_range(from_date, to_date, skip, limit)
+    records = repo.list_all_range(from_date, to_date, skip, limit)
+    return [AttendanceResponse.from_orm_with_user(r) for r in records]

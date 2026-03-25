@@ -23,11 +23,11 @@ class PaginatedResponse(BaseModel, Generic[DataT]):
 
     model_config = ConfigDict(from_attributes=True)
 
+    data: list[DataT]
     total: int
     page: int
     page_size: int
-    pages: int
-    items: list[DataT]
+    total_pages: int
 
 
 class MessageResponse(BaseModel):

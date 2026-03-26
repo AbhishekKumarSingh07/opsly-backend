@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from decimal import Decimal
-
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
@@ -21,18 +19,24 @@ router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 @router.get("/owner", dependencies=[Depends(require_role("owner"))])
 def owner_dashboard(db: Session = Depends(get_db)):
     """
-    Owner dashboard summary.
+    Owner dashboard summary — full business overview.
 
-    Returns:
-        open_tickets, overdue_amc, parts_in_field, pending_attendance_approvals,
-        monthly_revenue, tenders_by_status, top_pending_expenses,
-        today_attendance (with approver info), recent_tickets (with moderator/assignee info).
-
+    Returns all KPIs needed for the owner dashboard:
+    - Workforce: total employees, punched-in today, pending approvals
+    - Tickets: open, closed (completed/invoiced), total
+    - Inventory: total item types, total serialized items, items in field,
+                 per-status breakdown (IN_STOCK, CHECKED_OUT, DAMAGED, CONSUMED)
+    - Payroll: paid/pending count and amount for current month
+    - Recent tickets + today attendance feed
     - Accessible by: owner only.
     """
     from datetime import datetime, timezone
-    from app.models.ticket import Ticket
-    from app.models.user import User
+    from sqlalchemy import func, distinct
+    from app.models.ticket import Ticket, TicketStatus
+    from app.models.user import User, UserRole
+    from app.models.inventory import InventoryItem, InventoryItemStatus, InventoryStock
+    from app.models.payroll import SalaryRecord, SalaryStatus
+    from app.models.dg_set import DGSet
 
     ticket_repo = TicketRepository(db)
     inv_repo = InventoryRepository(db)
@@ -42,17 +46,89 @@ def owner_dashboard(db: Session = Depends(get_db)):
 
     today = datetime.now(timezone.utc).date()
 
-    # Overdue AMC
-    from app.models.dg_set import DGSet
+    # ── Workforce ──────────────────────────────────────────────────────────────
+    total_employees = (
+        db.query(func.count(User.id))
+        .filter(User.is_active.is_(True), User.role != UserRole.owner)
+        .scalar() or 0
+    )
+
+    # Punched in = has an attendance record today (any status except absent/rejected)
+    punched_in_today = (
+        db.query(func.count(Attendance.id))
+        .filter(
+            Attendance.date == today,
+            Attendance.status.in_([
+                AttendanceStatus.PENDING_APPROVAL,
+                AttendanceStatus.FLAGGED,
+                AttendanceStatus.APPROVED,
+            ]),
+        )
+        .scalar() or 0
+    )
+
+    # ── Tickets ────────────────────────────────────────────────────────────────
+    open_tickets = ticket_repo.count_open()
+    closed_tickets = (
+        db.query(func.count(Ticket.id))
+        .filter(
+            Ticket.status.in_([TicketStatus.COMPLETED, TicketStatus.INVOICED, TicketStatus.CANCELLED]),
+            Ticket.is_deleted.is_(False),
+        )
+        .scalar() or 0
+    )
+    total_tickets = (
+        db.query(func.count(Ticket.id))
+        .filter(Ticket.is_deleted.is_(False))
+        .scalar() or 0
+    )
+
+    # ── Inventory ──────────────────────────────────────────────────────────────
+    # Total distinct part types (serialized items by part_name)
+    total_item_types = (
+        db.query(func.count(distinct(InventoryItem.part_name)))
+        .filter(InventoryItem.is_deleted.is_(False))
+        .scalar() or 0
+    )
+    total_items = (
+        db.query(func.count(InventoryItem.id))
+        .filter(InventoryItem.is_deleted.is_(False))
+        .scalar() or 0
+    )
+
+    # Per-status breakdown
+    inv_status_rows = (
+        db.query(InventoryItem.status, func.count(InventoryItem.id))
+        .filter(InventoryItem.is_deleted.is_(False))
+        .group_by(InventoryItem.status)
+        .all()
+    )
+    inv_by_status = {row[0].value: row[1] for row in inv_status_rows}
+
+    # ── Overdue AMC ────────────────────────────────────────────────────────────
     overdue_amc = (
         db.query(DGSet)
         .filter(DGSet.next_service_date <= today, DGSet.is_deleted.is_(False))
         .count()
     )
 
-    top_expenses = expense_repo.top_pending(5)
+    # ── Payroll (current month) ─────────────────────────────────────────────────
+    payroll_rows = (
+        db.query(SalaryRecord.status, func.count(SalaryRecord.id), func.sum(SalaryRecord.net_payable))
+        .filter(SalaryRecord.year == today.year, SalaryRecord.month == today.month)
+        .group_by(SalaryRecord.status)
+        .all()
+    )
+    payroll_summary = {}
+    for row in payroll_rows:
+        payroll_summary[row[0].value] = {
+            "count": row[1],
+            "total": float(row[2] or 0),
+        }
+    payroll_paid = payroll_summary.get("PAID", {"count": 0, "total": 0.0})
+    payroll_pending = payroll_summary.get("PENDING", {"count": 0, "total": 0.0})
 
-    # Today's attendance — include approver name + role
+    # ── Today's attendance feed ────────────────────────────────────────────────
     today_attendance_records = att_repo.list_all_range(today, today, 0, 200)
     today_attendance = []
     for rec in today_attendance_records:
@@ -67,14 +143,12 @@ def owner_dashboard(db: Session = Depends(get_db)):
             "punch_in_time": rec.punch_in_time.isoformat() if rec.punch_in_time else None,
             "punch_out_time": rec.punch_out_time.isoformat() if rec.punch_out_time else None,
             "flag_reason": rec.flag_reason,
-            "approved_by_id": str(rec.approved_by) if rec.approved_by else None,
             "approved_by_name": approver.name if approver else None,
-            "approved_by_role": approver.role.value if approver else None,
             "approved_at": rec.approved_at.isoformat() if rec.approved_at else None,
         })
 
-    # Recent tickets — include creator (moderator) + assigned technicians
-    recent_tickets_raw = ticket_repo.list_all(skip=0, limit=10)
+    # ── Recent tickets ─────────────────────────────────────────────────────────
+    recent_tickets_raw = ticket_repo.list_all(skip=0, limit=8)
     recent_tickets = []
     for t in recent_tickets_raw:
         creator = db.get(User, t.created_by)
@@ -84,30 +158,35 @@ def owner_dashboard(db: Session = Depends(get_db)):
             "reference_no": t.reference_no,
             "status": t.status.value,
             "priority": t.priority.value,
-            "reported_issue": t.reported_issue[:100],
-            "created_by_id": str(t.created_by),
+            "reported_issue": t.reported_issue[:80],
             "created_by_name": creator.name if creator else None,
-            "created_by_role": creator.role.value if creator else None,
             "assigned_to": technician_names,
             "created_at": t.created_at.isoformat() if t.created_at else None,
         })
 
     return {
-        "open_tickets": ticket_repo.count_open(),
-        "overdue_amc": overdue_amc,
-        "parts_in_field": inv_repo.count_in_field(),
+        # Workforce
+        "total_employees": total_employees,
+        "punched_in_today": punched_in_today,
         "pending_attendance_approvals": att_repo.count_pending(),
-        "monthly_revenue": Decimal("0.00"),  # TODO: wire to invoice totals
+        # Tickets
+        "open_tickets": open_tickets,
+        "closed_tickets": closed_tickets,
+        "total_tickets": total_tickets,
+        # Inventory
+        "total_item_types": total_item_types,
+        "total_items": total_items,
+        "parts_in_field": inv_repo.count_in_field(),
+        "inventory_by_status": inv_by_status,
+        # Overdue AMC
+        "overdue_amc": overdue_amc,
+        # Payroll (current month)
+        "payroll_paid_count": payroll_paid["count"],
+        "payroll_paid_total": payroll_paid["total"],
+        "payroll_pending_count": payroll_pending["count"],
+        "payroll_pending_total": payroll_pending["total"],
+        # Feeds
         "tenders_by_status": tender_repo.count_by_status(),
-        "top_pending_expenses": [
-            {
-                "id": str(e.id),
-                "amount": str(e.amount),
-                "submitted_by": str(e.submitted_by),
-                "ticket_ref": str(e.ticket_id) if e.ticket_id else None,
-            }
-            for e in top_expenses
-        ],
         "today_attendance": today_attendance,
         "recent_tickets": recent_tickets,
     }

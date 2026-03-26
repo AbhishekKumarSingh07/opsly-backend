@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import get_current_user, get_db, require_role
+from app.models.user import UserRole
 from app.repositories.attendance_repo import AttendanceRepository
 from app.schemas.attendance import (
     AttendanceApproveSchema,
@@ -17,6 +18,8 @@ from app.schemas.attendance import (
     AttendanceResponse,
     AttendanceCalendarDay,
     AttendanceCalendarEntry,
+    StaffMonthlyAttendanceSummary,
+    StaffOverallAttendanceSummary,
 )
 from app.services.attendance_service import AttendanceService
 
@@ -61,15 +64,23 @@ def punch_out(
 def pending_approvals(
     skip: int = 0,
     limit: int = 50,
+    current_user=Depends(require_role("owner", "moderator")),
     db: Session = Depends(get_db),
 ):
     """
     Return all attendance records awaiting approval.
 
+    - Moderators cannot see their own pending record (self-approval prevention).
+    - Owners see all pending records.
     - Accessible by: owner, moderator.
     """
     repo = AttendanceRepository(db)
-    records = repo.list_pending(skip=skip, limit=limit)
+    # Exclude the moderator's own record so it never appears in the approval list.
+    # Owners have no such restriction — their attendance must be approved by the owner
+    # themselves (or left pending), but the approve endpoint already blocks self-approval
+    # via PermissionPolicy.require_can_approve_attendance().
+    exclude = current_user.id if current_user.role == UserRole.moderator else None
+    records = repo.list_pending(skip=skip, limit=limit, exclude_user_id=exclude)
     return [AttendanceResponse.from_orm_with_user(r) for r in records]
 
 
@@ -204,5 +215,142 @@ def all_attendance(
     - Accessible by: owner only.
     """
     repo = AttendanceRepository(db)
-    records = repo.list_all_range(from_date, to_date, skip, limit)
+    records = repo.list_all_with_approver(from_date, to_date, skip, limit)
     return [AttendanceResponse.from_orm_with_user(r) for r in records]
+
+
+# ─── Owner: per-staff attendance summary ─────────────────────────────────────
+
+@router.get(
+    "/staff/{user_id}/monthly",
+    response_model=StaffMonthlyAttendanceSummary,
+    dependencies=[Depends(require_role("owner"))],
+)
+def staff_monthly_summary(
+    user_id: UUID,
+    year: int = Query(..., ge=2020, le=2099),
+    month: int = Query(..., ge=1, le=12),
+    db: Session = Depends(get_db),
+):
+    """
+    Return a monthly attendance summary for a specific staff/moderator member.
+
+    Calculates present/pending/flagged/absent counts for the given month.
+    Accessible by: owner only.
+    """
+    import calendar as cal_mod
+
+    repo = AttendanceRepository(db)
+    from app.repositories.user_repo import UserRepository
+
+    user = UserRepository(db).get_by_id(user_id)
+    if not user:
+        from app.core.exceptions import NotFoundError
+        raise NotFoundError("User", str(user_id))
+
+    records = repo.list_for_user(user_id, date(year, month, 1), date(year, month, cal_mod.monthrange(year, month)[1]), 0, 1000)
+
+    present = sum(1 for r in records if r.status.value == "APPROVED")
+    pending = sum(1 for r in records if r.status.value == "PENDING_APPROVAL")
+    flagged = sum(1 for r in records if r.status.value == "FLAGGED")
+
+    # Working days = Mon–Sat count in the month
+    total_working = sum(
+        1 for d in range(1, cal_mod.monthrange(year, month)[1] + 1)
+        if cal_mod.weekday(year, month, d) != 6  # 6 = Sunday
+    )
+    absent = max(0, total_working - present)
+    pct = round((present / total_working * 100) if total_working else 0.0, 1)
+
+    return StaffMonthlyAttendanceSummary(
+        user_id=user.id,
+        user_name=user.name,
+        user_role=user.role.value,
+        year=year,
+        month=month,
+        total_working_days=total_working,
+        present_days=present,
+        pending_days=pending,
+        flagged_days=flagged,
+        absent_days=absent,
+        attendance_pct=pct,
+    )
+
+
+@router.get(
+    "/staff/{user_id}/overall",
+    response_model=StaffOverallAttendanceSummary,
+    dependencies=[Depends(require_role("owner"))],
+)
+def staff_overall_summary(
+    user_id: UUID,
+    db: Session = Depends(get_db),
+):
+    """
+    Return full attendance history and per-month breakdown for a staff member.
+
+    Includes approver name on each record for approval auditing.
+    Accessible by: owner only.
+    """
+    import calendar as cal_mod
+    from collections import defaultdict
+
+    repo = AttendanceRepository(db)
+    from app.repositories.user_repo import UserRepository
+
+    user = UserRepository(db).get_by_id(user_id)
+    if not user:
+        from app.core.exceptions import NotFoundError
+        raise NotFoundError("User", str(user_id))
+
+    all_records = repo.list_for_user_full(user_id, skip=0, limit=2000)
+
+    total_approved = sum(1 for r in all_records if r.status.value == "APPROVED")
+    total_pending = sum(1 for r in all_records if r.status.value == "PENDING_APPROVAL")
+    total_flagged = sum(1 for r in all_records if r.status.value == "FLAGGED")
+
+    # Build monthly breakdown
+    by_month: dict[tuple[int, int], list] = defaultdict(list)
+    for r in all_records:
+        by_month[(r.date.year, r.date.month)].append(r)
+
+    monthly_breakdown: list[StaffMonthlyAttendanceSummary] = []
+    for (yr, mo), recs in sorted(by_month.items(), reverse=True):
+        present = sum(1 for r in recs if r.status.value == "APPROVED")
+        pending = sum(1 for r in recs if r.status.value == "PENDING_APPROVAL")
+        flagged = sum(1 for r in recs if r.status.value == "FLAGGED")
+        total_working = sum(
+            1 for d in range(1, cal_mod.monthrange(yr, mo)[1] + 1)
+            if cal_mod.weekday(yr, mo, d) != 6
+        )
+        absent = max(0, total_working - present)
+        pct = round((present / total_working * 100) if total_working else 0.0, 1)
+        monthly_breakdown.append(
+            StaffMonthlyAttendanceSummary(
+                user_id=user.id,
+                user_name=user.name,
+                user_role=user.role.value,
+                year=yr,
+                month=mo,
+                total_working_days=total_working,
+                present_days=present,
+                pending_days=pending,
+                flagged_days=flagged,
+                absent_days=absent,
+                attendance_pct=pct,
+            )
+        )
+
+    # Recent 30 records with approver names
+    recent = all_records[:30]
+
+    return StaffOverallAttendanceSummary(
+        user_id=user.id,
+        user_name=user.name,
+        user_role=user.role.value,
+        total_approved=total_approved,
+        total_pending=total_pending,
+        total_flagged=total_flagged,
+        monthly_breakdown=monthly_breakdown,
+        recent_records=[AttendanceResponse.from_orm_with_user(r) for r in recent],
+    )

@@ -135,6 +135,7 @@ class AttendanceResponse(BaseModel):
     flag_reason: str | None
     status: AttendanceStatus
     approved_by: UUID | None
+    approved_by_name: str | None = None  # Approver's display name
     approved_at: datetime | None
     approval_notes: str | None
     ticket_id: UUID | None
@@ -142,9 +143,49 @@ class AttendanceResponse(BaseModel):
 
     @classmethod
     def from_orm_with_user(cls, record: object) -> "AttendanceResponse":
-        """Build response, resolving user name from relationship if loaded."""
+        """Build response, resolving user name and approver name from relationships."""
         obj = cls.model_validate(record)
         user = getattr(record, "user", None)
         if user is not None:
             obj.user_name = getattr(user, "full_name", None) or getattr(user, "name", None)
+        approver = getattr(record, "approver", None)
+        if approver is not None:
+            obj.approved_by_name = getattr(approver, "name", None)
         return obj
+
+
+# ─── Staff Attendance Summary (Owner view) ────────────────────────────────────
+
+class StaffMonthlyAttendanceSummary(BaseModel):
+    """
+    Monthly attendance summary for a single staff/moderator member.
+    Used by the owner's staff management page.
+    """
+
+    user_id: UUID
+    user_name: str
+    user_role: str
+    year: int
+    month: int              # 1–12
+    total_working_days: int  # Calendar working days in the month (Mon–Sat)
+    present_days: int        # Records with status APPROVED
+    pending_days: int        # Records with status PENDING_APPROVAL
+    flagged_days: int        # Records with status FLAGGED
+    absent_days: int         # total_working_days - present_days
+    attendance_pct: float    # present_days / total_working_days × 100
+
+
+class StaffOverallAttendanceSummary(BaseModel):
+    """
+    Overall (all-time) attendance snapshot for a single staff/moderator.
+    Includes a breakdown per month and approver info for each record.
+    """
+
+    user_id: UUID
+    user_name: str
+    user_role: str
+    total_approved: int
+    total_pending: int
+    total_flagged: int
+    monthly_breakdown: list[StaffMonthlyAttendanceSummary]
+    recent_records: list[AttendanceResponse]   # last 30 records, newest first

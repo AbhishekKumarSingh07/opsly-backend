@@ -33,13 +33,18 @@ def create_app() -> FastAPI:
         description=(
             "Field Operations ERP for Rahul Electricals & Creative Solutions.\n\n"
             "## Authentication\n"
-            "1. Call `POST /api/v1/auth/login` with your email & password.\n"
-            "2. Copy the `access_token` from the response.\n"
-            "3. Click the **Authorize** 🔒 button (top-right) and enter: `Bearer <token>`."
+            "Click **Authorize 🔒** (top-right), enter your **email** as username and **password**, "
+            "then click Authorize. All endpoints will be authenticated automatically.\n\n"
+            "Alternatively: call `POST /api/v1/auth/login`, copy the `access_token`, "
+            "and paste it into the BearerAuth section as `Bearer <token>`."
         ),
         docs_url="/docs",
         redoc_url="/redoc",
         swagger_ui_oauth2_redirect_url="/docs/oauth2-redirect",
+        swagger_ui_parameters={
+            "persistAuthorization": True,
+            "defaultModelsExpandDepth": -1,
+        },
         openapi_tags=[
             {"name": "Auth",       "description": "Login, logout, token refresh"},
             {"name": "Users",      "description": "User management"},
@@ -54,10 +59,11 @@ def create_app() -> FastAPI:
             {"name": "Sync",       "description": "Offline sync"},
             {"name": "Health",     "description": "Health check"},
             {"name": "Bulk Import", "description": "Bulk staff & inventory import"},
+            {"name": "Payroll",    "description": "Salary records & advance payments"},
         ],
     )
 
-    # ── OpenAPI security scheme (Bearer JWT) ────────────────────────────────────
+    # ── OpenAPI security scheme (Bearer JWT + OAuth2 password flow for Swagger UI) ─
     from fastapi.openapi.utils import get_openapi
 
     def custom_openapi():
@@ -71,19 +77,38 @@ def create_app() -> FastAPI:
             tags=app.openapi_tags,
         )
         schema.setdefault("components", {}).setdefault("securitySchemes", {})
+
+        # BearerAuth — lets users paste a raw token via the 🔒 Authorize dialog
         schema["components"]["securitySchemes"]["BearerAuth"] = {
             "type": "http",
             "scheme": "bearer",
             "bearerFormat": "JWT",
-            "description": "Paste the access_token returned by /auth/login",
+            "description": "Paste the `access_token` returned by POST /auth/login",
         }
-        # Apply BearerAuth globally to every operation except /auth/login and /health
+
+        # OAuth2PasswordBearer — gives Swagger UI a proper username/password form
+        # in the Authorize dialog that calls /auth/login and captures the token.
+        schema["components"]["securitySchemes"]["OAuth2PasswordBearer"] = {
+            "type": "oauth2",
+            "flows": {
+                "password": {
+                    "tokenUrl": "/api/v1/auth/login",
+                    "scopes": {},
+                }
+            },
+            "description": "Log in with email (username) and password directly from Swagger UI",
+        }
+
+        # Apply both schemes globally to every protected operation
         for path, path_item in schema.get("paths", {}).items():
             if path in ("/api/v1/auth/login", "/api/v1/auth/refresh", "/health"):
                 continue
             for operation in path_item.values():
                 if isinstance(operation, dict):
-                    operation.setdefault("security", [{"BearerAuth": []}])
+                    operation.setdefault("security", [
+                        {"BearerAuth": []},
+                        {"OAuth2PasswordBearer": []},
+                    ])
         app.openapi_schema = schema
         return app.openapi_schema
 
@@ -128,6 +153,7 @@ def create_app() -> FastAPI:
         client_portal,
         sync,
         bulk_import,
+        payroll,
     )
 
     PREFIX = "/api/v1"
@@ -143,6 +169,7 @@ def create_app() -> FastAPI:
     app.include_router(client_portal.router, prefix=PREFIX)
     app.include_router(sync.router, prefix=PREFIX)
     app.include_router(bulk_import.router, prefix=PREFIX)
+    app.include_router(payroll.router, prefix=PREFIX)
 
     # ── Startup / Shutdown events ───────────────────────────────────────────────
     @app.on_event("startup")

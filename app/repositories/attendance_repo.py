@@ -23,15 +23,25 @@ class AttendanceRepository(BaseRepository[Attendance]):
             .first()
         )
 
-    def list_pending(self, skip: int = 0, limit: int = 100) -> list[Attendance]:
-        """Return all records awaiting approval."""
-        return (
-            self.db.query(Attendance)
-            .filter(Attendance.status == AttendanceStatus.PENDING_APPROVAL)
-            .offset(skip)
-            .limit(limit)
-            .all()
+    def list_pending(
+        self,
+        skip: int = 0,
+        limit: int = 100,
+        exclude_user_id: UUID | None = None,
+    ) -> list[Attendance]:
+        """Return all records awaiting approval.
+
+        Args:
+            exclude_user_id: When provided, the attendance record belonging
+                to this user is excluded from the results.  Used so that a
+                moderator never sees (or can approve) their own record.
+        """
+        q = self.db.query(Attendance).filter(
+            Attendance.status == AttendanceStatus.PENDING_APPROVAL
         )
+        if exclude_user_id is not None:
+            q = q.filter(Attendance.user_id != exclude_user_id)
+        return q.offset(skip).limit(limit).all()
 
     def list_for_user(
         self, user_id: UUID, from_date: date | None, to_date: date | None, skip: int, limit: int
@@ -74,3 +84,55 @@ class AttendanceRepository(BaseRepository[Attendance]):
             .filter(Attendance.status == AttendanceStatus.PENDING_APPROVAL)
             .count()
         )
+
+    def list_for_user_full(
+        self,
+        user_id: UUID,
+        skip: int = 0,
+        limit: int = 200,
+    ) -> list[Attendance]:
+        """
+        Return attendance records for a user with both user and approver
+        relationships loaded — used for the owner's per-staff detail view.
+        """
+        from sqlalchemy.orm import joinedload, aliased
+        from app.models.user import User
+
+        return (
+            self.db.query(Attendance)
+            .options(
+                joinedload(Attendance.user),
+                joinedload(Attendance.approver),
+            )
+            .filter(Attendance.user_id == user_id)
+            .order_by(Attendance.date.desc())
+            .offset(skip)
+            .limit(limit)
+            .all()
+        )
+
+    def list_all_with_approver(
+        self,
+        from_date: date | None,
+        to_date: date | None,
+        skip: int,
+        limit: int,
+    ) -> list[Attendance]:
+        """
+        Return all attendance records with user + approver relationships loaded,
+        optionally filtered by date range.
+        """
+        from sqlalchemy.orm import joinedload
+
+        q = (
+            self.db.query(Attendance)
+            .options(
+                joinedload(Attendance.user),
+                joinedload(Attendance.approver),
+            )
+        )
+        if from_date:
+            q = q.filter(Attendance.date >= from_date)
+        if to_date:
+            q = q.filter(Attendance.date <= to_date)
+        return q.order_by(Attendance.date.desc()).offset(skip).limit(limit).all()

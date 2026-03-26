@@ -29,6 +29,7 @@ class AttendanceService:
         Record a punch-in event for the given user.
 
         Rules:
+        - Owner role is exempt from attendance tracking and cannot punch in.
         - One punch-in per user per calendar day.
         - GPS coordinates are recorded silently in the background; no
           geofence error is raised and no flag is set automatically.
@@ -38,6 +39,12 @@ class AttendanceService:
           sufficient. ticket_id can be linked later during approval.
         """
         from datetime import date
+
+        if user.role == UserRole.owner:
+            raise PermissionDeniedError(
+                "The owner role is exempt from attendance tracking. "
+                "Punch-in is not required or permitted for owner accounts."
+            )
 
         today = datetime.now(timezone.utc).date()
         existing = self.repo.get_today_record(user.id, today)
@@ -151,6 +158,12 @@ class AttendanceService:
         target_user = UserRepository(self.db).get_by_id(payload.user_id)
         if not target_user:
             raise NotFoundError("User", str(payload.user_id))
+
+        if target_user.role == UserRole.owner:
+            raise PermissionDeniedError(
+                "The owner role is exempt from attendance tracking. "
+                "Attendance records cannot be created for owner accounts."
+            )
 
         # Moderators may only add attendance for staff
         PermissionPolicy(approver).require_can_approve_attendance(target_user)

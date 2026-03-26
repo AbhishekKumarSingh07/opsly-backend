@@ -12,6 +12,7 @@ from app.models.expense import Expense, ExpenseStatus
 from app.models.client import Client
 from app.models.audit_log import AuditLog, AuditAction
 from app.models.bulk_import import BulkImportLog, ImportType, ImportFormat, ImportStatus
+from app.models.payroll import SalaryRecord, SalaryStatus, AdvancePayment
 
 __all__ = [
     "User", "UserRole",
@@ -24,4 +25,5 @@ __all__ = [
     "Expense", "ExpenseStatus",
     "Client",
     "AuditLog", "AuditAction",
+    "SalaryRecord", "SalaryStatus", "AdvancePayment",
 ]

@@ -16,6 +16,7 @@ class UserRole(str, enum.Enum):
     owner = "owner"
     moderator = "moderator"
     staff = "staff"
+    technician = "technician"
 
 
 class User(Base, UUIDMixin, TimestampMixin):

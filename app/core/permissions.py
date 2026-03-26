@@ -59,14 +59,14 @@ class PermissionPolicy:
     def require_can_create_user(self, target_role: UserRole) -> None:
         """
         Owner can create any role.
-        Moderator can only create staff accounts.
+        Moderator can only create staff or technician accounts.
         """
         if self.user.role == UserRole.owner:
             return
         if self.user.role == UserRole.moderator:
-            if target_role != UserRole.staff:
+            if target_role not in (UserRole.staff, UserRole.technician):
                 raise PermissionDeniedError(
-                    "Moderators can only create staff accounts."
+                    "Moderators can only create staff or technician accounts."
                 )
             return
         raise PermissionDeniedError("Insufficient permissions to create users.")

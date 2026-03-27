@@ -13,6 +13,7 @@ from app.schemas.inventory import (
     InventoryIntakeSchema,
     InventoryItemResponse,
     InventoryReturnSchema,
+    InventoryStockResponse,
 )
 from app.services.inventory_service import InventoryService
 from app.utils.pagination import paginate
@@ -106,6 +107,32 @@ def list_inventory(
     )
 
 
+@router.get("/low-stock", response_model=list[InventoryStockResponse], dependencies=[Depends(require_role("owner", "moderator"))])
+def get_low_stock_items(db: Session = Depends(get_db)):
+    """
+    Return all bulk stock items whose quantity is at or below the reorder level.
+
+    - Accessible by: owner, moderator.
+    """
+    repo = InventoryRepository(db)
+    return repo.list_low_stock(db)
+
+
+@router.get("/barcode/{barcode}", response_model=InventoryItemResponse, dependencies=[Depends(require_role("owner", "moderator"))])
+def get_item_by_barcode(barcode: str, db: Session = Depends(get_db)):
+    """
+    Fetch a single inventory item by its barcode.
+
+    - Accessible by: owner, moderator.
+    """
+    from app.core.exceptions import NotFoundError
+    repo = InventoryRepository(db)
+    item = repo.get_by_barcode(barcode)
+    if not item or item.is_deleted:
+        raise NotFoundError("InventoryItem", f"barcode={barcode}")
+    return InventoryItemResponse.model_validate(item)
+
+
 @router.get("/{item_id}", response_model=InventoryItemResponse, dependencies=[Depends(require_role("owner", "moderator"))])
 def get_item(item_id: UUID, db: Session = Depends(get_db)):
     """
@@ -118,4 +145,4 @@ def get_item(item_id: UUID, db: Session = Depends(get_db)):
     item = repo.get_by_id(item_id)
     if not item or item.is_deleted:
         raise NotFoundError("InventoryItem", str(item_id))
-    return item
+    return InventoryItemResponse.model_validate(item)

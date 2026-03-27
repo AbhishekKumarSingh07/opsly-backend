@@ -19,7 +19,42 @@ from app.services.payroll_service import PayrollService
 router = APIRouter(prefix="/payroll", tags=["Payroll"])
 
 
-# ─── Payroll Summary ──────────────────────────────────────────────────────────
+# ─── Staff self-service: own payroll records ──────────────────────────────────
+
+@router.get(
+    "/my",
+    response_model=list[SalaryRecordResponse],
+)
+def my_salary_records(
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Return the authenticated user's own salary records.
+
+    - Accessible by: all roles (staff see only their own records).
+    """
+    service = PayrollService(db)
+    records = service.list_salary_records_for_user(current_user.id)
+    return [SalaryRecordResponse.from_orm_with_relations(r) for r in records]
+
+
+@router.get(
+    "/my/advances",
+    response_model=list[AdvancePaymentResponse],
+)
+def my_advance_payments(
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Return the authenticated user's own advance payment history.
+
+    - Accessible by: all roles (staff see only their own records).
+    """
+    service = PayrollService(db)
+    advances = service.list_advances_for_user(current_user.id)
+    return [AdvancePaymentResponse.from_orm_with_relations(a) for a in advances]
 
 @router.get(
     "/summary",

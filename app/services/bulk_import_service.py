@@ -26,11 +26,12 @@ from app.core.exceptions import BusinessRuleError
 from app.core.permissions import PermissionPolicy
 from app.core.security import hash_password
 from app.models.bulk_import import BulkImportLog, ImportFormat, ImportStatus, ImportType
-from app.models.inventory import InventoryItem, InventoryItemStatus
+from app.models.inventory import InventoryItem
 from app.models.user import User, UserRole
 from app.repositories.inventory_repo import InventoryRepository
 from app.repositories.user_repo import UserRepository
 from app.schemas.bulk_import import (
+    CategoryImportRow,
     InventoryImportRow,
     RowError,
     StaffImportRow,
@@ -41,7 +42,8 @@ logger = logging.getLogger("opsly.bulk_import")
 # ─── Template definitions ────────────────────────────────────────────────────
 
 STAFF_COLUMNS = ["name", "email", "phone", "role"]
-INVENTORY_COLUMNS = ["part_name", "part_number", "serial_no", "barcode", "description", "unit_cost"]
+INVENTORY_COLUMNS = ["part_name", "part_number", "category", "barcode", "quantity", "unit_cost"]
+CATEGORY_COLUMNS = ["category_name", "description"]
 
 STAFF_EXAMPLE_ROW = {
     "name": "Ravi Kumar",
@@ -52,10 +54,14 @@ STAFF_EXAMPLE_ROW = {
 INVENTORY_EXAMPLE_ROW = {
     "part_name": "AVR Module",
     "part_number": "AVR-001",
-    "serial_no": "SN123456",
+    "category": "Electrical",
     "barcode": "BC123456",
-    "description": "Automatic Voltage Regulator",
+    "quantity": "10",
     "unit_cost": "1500.00",
+}
+CATEGORY_EXAMPLE_ROW = {
+    "category_name": "AVR",
+    "description": "Automatic Voltage Regulators and components",
 }
 
 STAFF_INSTRUCTIONS = (
@@ -66,8 +72,14 @@ STAFF_INSTRUCTIONS = (
 )
 INVENTORY_INSTRUCTIONS = (
     "Required fields: part_name, part_number. "
-    "serial_no and barcode must be unique if provided. "
-    "unit_cost defaults to 0.00 if omitted."
+    "barcode must be unique if provided. "
+    "category will be created if it does not exist. "
+    "quantity defaults to 0, unit_cost defaults to 0.00 if omitted."
+)
+CATEGORY_INSTRUCTIONS = (
+    "Required fields: category_name. "
+    "description is optional. "
+    "Existing categories are updated (upsert by name)."
 )
 
 
@@ -192,7 +204,7 @@ class BulkImportService:
         return log
 
     async def import_inventory(self, file: UploadFile, actor: User) -> BulkImportLog:
-        """Parse and import serialized inventory items from an uploaded file."""
+        """Parse and import inventory items from an uploaded file (quantity-based model)."""
         PermissionPolicy(actor).require_can_bulk_import()
 
         content = await file.read()
@@ -209,18 +221,42 @@ class BulkImportService:
             try:
                 row = InventoryImportRow.model_validate(row_data)
 
+                # Resolve or create category
+                category_id = None
+                if row.category:
+                    from app.models.inventory import InventoryCategory
+                    cat = (
+                        self.db.query(InventoryCategory)
+                        .filter(
+                            InventoryCategory.category_name == row.category,
+                            InventoryCategory.is_deleted.is_(False),
+                        )
+                        .first()
+                    )
+                    if cat is None:
+                        cat = InventoryCategory(category_name=row.category)
+                        self.db.add(cat)
+                        self.db.flush()
+                    category_id = cat.id
+
                 existing: InventoryItem | None = None
                 if row.barcode:
                     existing = self.inv_repo.get_by_barcode(row.barcode)
-                if existing is None and row.serial_no:
-                    existing = self.inv_repo.get_by_serial(row.serial_no)
+                if existing is None:
+                    existing = self.inv_repo.get_by_part_number(row.part_number)
 
                 if existing is not None:
                     # Update the existing item instead of failing
                     existing.part_name = row.part_name
                     existing.part_number = row.part_number
-                    existing.description = row.description
-                    existing.unit_cost = row.unit_cost
+                    if category_id is not None:
+                        existing.category_id = category_id
+                    if row.barcode is not None:
+                        existing.barcode = row.barcode
+                    if row.unit_cost is not None:
+                        existing.unit_cost = row.unit_cost
+                    if row.quantity is not None:
+                        existing.quantity = row.quantity
                     self.db.flush()
                     success += 1
                     logger.info(
@@ -232,11 +268,10 @@ class BulkImportService:
                 item = InventoryItem(
                     part_name=row.part_name,
                     part_number=row.part_number,
-                    serial_no=row.serial_no,
+                    category_id=category_id,
                     barcode=row.barcode,
-                    description=row.description,
-                    unit_cost=row.unit_cost,
-                    status=InventoryItemStatus.IN_STOCK,
+                    unit_cost=row.unit_cost or Decimal("0.00"),
+                    quantity=row.quantity or 0,
                 )
                 self.db.add(item)
                 self.db.flush()
@@ -246,6 +281,62 @@ class BulkImportService:
             except (ValidationError, ValueError, Exception) as exc:
                 errors.append(RowError(row=idx, data=row_data, error=str(exc)))
                 logger.warning("Bulk import inventory row %d failed: %s", idx, exc)
+
+        self._finalise_log(log, success, errors)
+        return log
+
+    async def import_categories(self, file: UploadFile, actor: User) -> BulkImportLog:
+        """Parse and import inventory categories from an uploaded file (upsert by name)."""
+        from app.models.inventory import InventoryCategory
+
+        PermissionPolicy(actor).require_can_bulk_import()
+
+        content = await file.read()
+        file_format = _detect_format(file.filename or "upload.csv")
+        rows = _parse_file(content, file_format)
+
+        log = self._create_log(actor, ImportType.categories, file_format, file.filename or "", len(rows))
+
+        errors: list[RowError] = []
+        success = 0
+
+        for idx, row_data in enumerate(rows, start=1):
+            row_data = {k: (v if v != "" else None) for k, v in (row_data or {}).items()}
+            try:
+                row = CategoryImportRow.model_validate(row_data)
+
+                existing = (
+                    self.db.query(InventoryCategory)
+                    .filter(
+                        InventoryCategory.category_name == row.category_name,
+                        InventoryCategory.is_deleted.is_(False),
+                    )
+                    .first()
+                )
+
+                if existing is not None:
+                    # Update description if provided
+                    if row.description is not None:
+                        existing.description = row.description
+                    self.db.flush()
+                    success += 1
+                    logger.info(
+                        "Bulk import: updated existing category '%s' (row %d)",
+                        row.category_name, idx,
+                    )
+                else:
+                    cat = InventoryCategory(
+                        category_name=row.category_name,
+                        description=row.description,
+                    )
+                    self.db.add(cat)
+                    self.db.flush()
+                    success += 1
+                    logger.info("Bulk import: created category '%s' (row %d)", row.category_name, idx)
+
+            except (ValidationError, ValueError, Exception) as exc:
+                errors.append(RowError(row=idx, data=row_data, error=str(exc)))
+                logger.warning("Bulk import category row %d failed: %s", idx, exc)
 
         self._finalise_log(log, success, errors)
         return log
@@ -267,10 +358,21 @@ class BulkImportService:
     def get_inventory_template_csv() -> str:
         """Return a CSV template string for inventory import."""
         lines = [
-            "# Inventory Import Template — Required: part_name, part_number | Optional: serial_no, barcode, description, unit_cost",
-            "# unit_cost defaults to 0.00 | serial_no and barcode must be globally unique",
+            "# Inventory Import Template — Required: part_name, part_number | Optional: category, barcode, quantity, unit_cost",
+            "# barcode must be globally unique if provided | quantity defaults to 0 | unit_cost defaults to 0.00",
             ",".join(INVENTORY_COLUMNS),
             ",".join(str(INVENTORY_EXAMPLE_ROW[c]) for c in INVENTORY_COLUMNS),
+        ]
+        return "\n".join(lines)
+
+    @staticmethod
+    def get_categories_template_csv() -> str:
+        """Return a CSV template string for category import."""
+        lines = [
+            "# Categories Import Template — Required: category_name | Optional: description",
+            "# Existing categories are updated (upsert by name)",
+            ",".join(CATEGORY_COLUMNS),
+            ",".join(str(CATEGORY_EXAMPLE_ROW[c]) for c in CATEGORY_COLUMNS),
         ]
         return "\n".join(lines)
 

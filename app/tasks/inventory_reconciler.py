@@ -7,23 +7,23 @@ from sqlalchemy.orm import Session
 logger = logging.getLogger("opsly.inventory_reconciler")
 
 
-def check_overdue_checkouts(db: Session) -> None:
+def check_low_stock(db: Session) -> None:
     """
-    Nightly inventory reconciliation (runs at 02:00 IST via APScheduler).
+    Nightly inventory low-stock check (runs at 02:00 IST via APScheduler).
 
-    Finds all serialized inventory items that have been CHECKED_OUT for more
-    than 48 hours and notifies the owner.
+    Finds all inventory items whose quantity is at or below their effective
+    low-stock threshold and notifies the owner.
     """
     from app.repositories.inventory_repo import InventoryRepository
     from app.services.notification_service import NotificationService
 
     repo = InventoryRepository(db)
-    overdue_items = repo.list_overdue_checkouts(hours=48)
+    low_stock_items = repo.list_low_stock()
 
-    if overdue_items:
+    if low_stock_items:
         logger.warning(
-            "Found %d overdue checked-out items (>48h)", len(overdue_items)
+            "Found %d low-stock inventory items", len(low_stock_items)
         )
-        NotificationService(db).notify_overdue_parts(overdue_items)
+        NotificationService(db).notify_low_stock(low_stock_items)
     else:
-        logger.info("No overdue inventory items found.")
+        logger.info("No low-stock inventory items found.")

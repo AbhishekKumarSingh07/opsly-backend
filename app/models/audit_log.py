@@ -16,6 +16,8 @@ class AuditAction(str, enum.Enum):
     CREATE = "CREATE"
     UPDATE = "UPDATE"
     DELETE = "DELETE"
+    BULK_IMPORT = "BULK_IMPORT"
+    CONFIG_CHANGE = "CONFIG_CHANGE"
 
 
 class AuditLog(Base):

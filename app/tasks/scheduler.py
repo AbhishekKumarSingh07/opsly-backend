@@ -20,7 +20,7 @@ def get_scheduler() -> BackgroundScheduler:
 def start_scheduler() -> None:
     """Register all cron jobs and start the background scheduler."""
     from app.tasks.amc_checker import check_upcoming_amc_services
-    from app.tasks.inventory_reconciler import check_overdue_checkouts
+    from app.tasks.inventory_reconciler import check_low_stock
 
     scheduler = get_scheduler()
 
@@ -68,10 +68,10 @@ def _run_amc_check() -> None:
 
 def _run_inventory_reconciler() -> None:
     from app.db.base import SessionLocal
-    from app.tasks.inventory_reconciler import check_overdue_checkouts
+    from app.tasks.inventory_reconciler import check_low_stock
     db = SessionLocal()
     try:
-        check_overdue_checkouts(db)
+        check_low_stock(db)
         db.commit()
     except Exception as exc:
         logger.exception("Inventory reconciler failed: %s", exc)

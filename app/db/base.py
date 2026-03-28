@@ -36,5 +36,6 @@ def init_db() -> None:
         client,
         audit_log,
         bulk_import,
+        payroll,
     )
     Base.metadata.create_all(bind=engine)

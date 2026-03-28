@@ -102,9 +102,6 @@ class Ticket(Base, AuditMixin):
     photos: Mapped[list["TicketPhoto"]] = relationship(
         "TicketPhoto", back_populates="ticket", lazy="select", cascade="all, delete-orphan"
     )
-    inventory_items: Mapped[list["InventoryItem"]] = relationship(
-        "InventoryItem", back_populates="current_ticket", lazy="select"
-    )
 
     def __repr__(self) -> str:
         return f"<Ticket ref={self.reference_no} status={self.status}>"

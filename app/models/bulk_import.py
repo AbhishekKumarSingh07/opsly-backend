@@ -15,6 +15,7 @@ from app.db.mixins import UUIDMixin, TimestampMixin
 class ImportType(str, enum.Enum):
     inventory = "inventory"
     staff = "staff"
+    categories = "categories"
 
 
 class ImportFormat(str, enum.Enum):

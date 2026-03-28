@@ -42,13 +42,13 @@ class StaffImportRow(BaseModel):
 
 
 class InventoryImportRow(BaseModel):
-    """One inventory row from a bulk import file."""
+    """One inventory row from a bulk import file (quantity-based model)."""
 
     part_name: str
     part_number: str
-    serial_no: str | None = None
+    category: str | None = None
     barcode: str | None = None
-    description: str | None = None
+    quantity: int = 0
     unit_cost: Decimal = Decimal("0.00")
 
     @field_validator("unit_cost", mode="before")
@@ -58,6 +58,21 @@ class InventoryImportRow(BaseModel):
             return Decimal(str(v))
         except Exception:
             return Decimal("0.00")
+
+    @field_validator("quantity", mode="before")
+    @classmethod
+    def coerce_quantity(cls, v: Any) -> int:
+        try:
+            return int(str(v))
+        except Exception:
+            return 0
+
+
+class CategoryImportRow(BaseModel):
+    """One category row from a bulk import file."""
+
+    category_name: str
+    description: str | None = None
 
 
 # ─── Response schemas ────────────────────────────────────────────────────────

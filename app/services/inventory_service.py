@@ -1,189 +1,206 @@
 from __future__ import annotations
 
+import csv
+import io
 from datetime import datetime, timezone
+from decimal import Decimal
 from uuid import UUID
 
 from sqlalchemy.orm import Session
 
-from app.core.exceptions import BusinessRuleError, ConflictError, NotFoundError, PermissionDeniedError
-from app.models.inventory import InventoryItem, InventoryItemStatus, InventoryMovement
-from app.models.ticket import PhotoType, TicketPhoto, TicketStatus
-from app.models.user import User, UserRole
-from app.repositories.inventory_repo import InventoryRepository
-from app.repositories.ticket_repo import TicketRepository
-from app.schemas.inventory import InventoryIntakeSchema
+from app.core.exceptions import BusinessRuleError, ConflictError, NotFoundError
+from app.models.inventory import (
+    InventoryCategory,
+    InventoryItem,
+    LowStockConfig,
+)
+from app.models.user import User
+from app.repositories.inventory_repo import (
+    CategoryRepository,
+    InventoryRepository,
+    LowStockConfigRepository,
+)
+from app.schemas.inventory import (
+    BulkImportRow,
+    CategoryCreate,
+    CategoryUpdate,
+    InventoryItemCreate,
+    InventoryItemUpdate,
+    LowStockConfigCreate,
+    LowStockConfigUpdate,
+)
 
 
 class InventoryService:
-    """Business logic for serialized inventory lifecycle management."""
-
     def __init__(self, db: Session) -> None:
         self.db = db
-        self.repo = InventoryRepository(db)
+        self.cat_repo = CategoryRepository(db)
+        self.inv_repo = InventoryRepository(db)
+        self.config_repo = LowStockConfigRepository(db)
 
-    def intake_part(self, payload: InventoryIntakeSchema, actor: User) -> InventoryItem:
-        """
-        Receive a new part into inventory.
-        Validates barcode uniqueness, creates IN_STOCK record and movement log.
-        """
-        if payload.barcode:
-            existing = self.repo.get_by_barcode(payload.barcode)
-            if existing:
-                raise ConflictError(f"Barcode '{payload.barcode}' already exists in inventory.")
+    # ── Categories ──────────────────────────────────────────────────────────
 
-        if payload.serial_no:
-            existing_serial = self.repo.get_by_serial(payload.serial_no)
-            if existing_serial:
-                raise ConflictError(f"Serial number '{payload.serial_no}' already exists.")
+    def create_category(self, payload: CategoryCreate, actor: User) -> InventoryCategory:
+        if self.cat_repo.get_by_name(payload.category_name):
+            raise ConflictError(f"Category '{payload.category_name}' already exists.")
+        cat = InventoryCategory(
+            category_name=payload.category_name,
+            description=payload.description,
+        )
+        return self.cat_repo.create(cat)
 
+    def update_category(self, cat_id: UUID, payload: CategoryUpdate, actor: User) -> InventoryCategory:
+        cat = self.cat_repo.get_by_id(cat_id)
+        if not cat or cat.is_deleted:
+            raise NotFoundError("InventoryCategory", str(cat_id))
+        if payload.category_name and payload.category_name != cat.category_name:
+            if self.cat_repo.get_by_name(payload.category_name):
+                raise ConflictError(f"Category '{payload.category_name}' already exists.")
+            cat.category_name = payload.category_name
+        if payload.description is not None:
+            cat.description = payload.description
+        return self.cat_repo.save(cat)
+
+    def delete_category(self, cat_id: UUID, actor: User) -> None:
+        cat = self.cat_repo.get_by_id(cat_id)
+        if not cat or cat.is_deleted:
+            raise NotFoundError("InventoryCategory", str(cat_id))
+        if self.cat_repo.item_count(cat_id) > 0:
+            raise BusinessRuleError(
+                "CATEGORY_HAS_ITEMS",
+                "Cannot delete category that has inventory items. Reassign items first.",
+            )
+        cat.is_deleted = True
+        self.cat_repo.save(cat)
+
+    # ── Inventory Items ──────────────────────────────────────────────────────
+
+    def create_item(self, payload: InventoryItemCreate, actor: User) -> InventoryItem:
+        if self.inv_repo.get_by_part_number(payload.part_number):
+            raise ConflictError(f"Part number '{payload.part_number}' already exists.")
+        if payload.barcode and self.inv_repo.get_by_barcode(payload.barcode):
+            raise ConflictError(f"Barcode '{payload.barcode}' already exists.")
         item = InventoryItem(
             part_name=payload.part_name,
             part_number=payload.part_number,
-            serial_no=payload.serial_no,
-            barcode=payload.barcode,
-            description=payload.description,
+            category_id=payload.category_id,
+            barcode=payload.barcode or None,
             unit_cost=payload.unit_cost,
-            status=InventoryItemStatus.IN_STOCK,
+            quantity=payload.quantity,
+            low_stock_threshold=payload.low_stock_threshold,
         )
-        self.repo.create(item)
-        self._record_movement(item, None, InventoryItemStatus.IN_STOCK, actor, None, "Intake")
-        return item
+        return self.inv_repo.create(item)
 
-    def checkout_part(self, item_id: UUID, ticket_id: UUID, actor: User) -> InventoryItem:
-        """
-        Check out a part to a ticket.
-        Only moderator/owner can perform checkouts — staff cannot self-checkout.
-        """
-        if actor.role == UserRole.staff:
-            raise PermissionDeniedError("Staff cannot check out parts. Request a moderator.")
-
-        item = self.repo.get_by_id(item_id)
+    def update_item(self, item_id: UUID, payload: InventoryItemUpdate, actor: User) -> InventoryItem:
+        item = self.inv_repo.get_by_id(item_id)
         if not item or item.is_deleted:
             raise NotFoundError("InventoryItem", str(item_id))
+        if payload.barcode and payload.barcode != item.barcode:
+            if self.inv_repo.get_by_barcode(payload.barcode):
+                raise ConflictError(f"Barcode '{payload.barcode}' already exists.")
+        for field in ("part_name", "category_id", "barcode", "unit_cost", "quantity", "low_stock_threshold"):
+            val = getattr(payload, field, None)
+            if val is not None:
+                setattr(item, field, val)
+        return self.inv_repo.save(item)
 
-        if item.status != InventoryItemStatus.IN_STOCK:
-            raise BusinessRuleError(
-                "ITEM_NOT_IN_STOCK",
-                f"Item is currently {item.status.value}, not IN_STOCK.",
-            )
-
-        ticket_repo = TicketRepository(self.db)
-        ticket = ticket_repo.get_by_id(ticket_id)
-        if not ticket:
-            raise NotFoundError("Ticket", str(ticket_id))
-
-        if ticket.status not in (TicketStatus.ASSIGNED, TicketStatus.IN_PROGRESS):
-            raise BusinessRuleError(
-                "INVALID_TICKET_STATUS",
-                f"Parts can only be checked out for ASSIGNED or IN_PROGRESS tickets. "
-                f"Ticket is currently {ticket.status.value}.",
-            )
-
-        item.status = InventoryItemStatus.CHECKED_OUT
-        item.current_ticket_id = ticket_id
-        item.checked_out_at = datetime.now(timezone.utc)
-        item.checked_out_by = actor.id
-
-        self.repo.save(item)
-        self._record_movement(item, InventoryItemStatus.IN_STOCK, InventoryItemStatus.CHECKED_OUT, actor, ticket_id)
-        return item
-
-    def record_installation(
-        self,
-        item_id: UUID,
-        ticket_id: UUID,
-        actor: User,
-        part_new_photo_url: str,
-        part_old_photo_url: str,
-    ) -> InventoryItem:
-        """
-        Record that a part has been installed on a ticket.
-        Saves both PART_NEW and PART_OLD photos.
-        Transitions item to PENDING_RETURN.
-        """
-        item = self.repo.get_by_id(item_id)
+    def delete_item(self, item_id: UUID, actor: User) -> None:
+        item = self.inv_repo.get_by_id(item_id)
         if not item or item.is_deleted:
             raise NotFoundError("InventoryItem", str(item_id))
+        item.is_deleted = True
+        self.inv_repo.save(item)
 
-        if item.status != InventoryItemStatus.CHECKED_OUT or item.current_ticket_id != ticket_id:
-            raise BusinessRuleError(
-                "ITEM_NOT_ON_TICKET",
-                "Item is not checked out on this ticket.",
-            )
+    # ── Low Stock Config ──────────────────────────────────────────────────────
 
-        # Save photos
-        for photo_type, url in [
-            (PhotoType.PART_NEW, part_new_photo_url),
-            (PhotoType.PART_OLD, part_old_photo_url),
-        ]:
-            photo = TicketPhoto(
-                ticket_id=ticket_id,
-                photo_type=photo_type,
-                s3_url=url,
-                uploaded_by=actor.id,
-                uploaded_at=datetime.now(timezone.utc),
-            )
-            self.db.add(photo)
-
-        item.status = InventoryItemStatus.PENDING_RETURN
-        self.repo.save(item)
-        self._record_movement(
-            item, InventoryItemStatus.CHECKED_OUT, InventoryItemStatus.PENDING_RETURN, actor, ticket_id, "Installed"
+    def set_low_stock_config(self, payload: LowStockConfigCreate, actor: User) -> LowStockConfig:
+        item = self.inv_repo.get_by_id(payload.inventory_item_id)
+        if not item or item.is_deleted:
+            raise NotFoundError("InventoryItem", str(payload.inventory_item_id))
+        existing = self.config_repo.get_by_item(payload.inventory_item_id)
+        if existing:
+            existing.threshold = payload.threshold
+            existing.configured_by = actor.id
+            existing.configured_at = datetime.now(timezone.utc)
+            return self.config_repo.save(existing)
+        config = LowStockConfig(
+            inventory_item_id=payload.inventory_item_id,
+            threshold=payload.threshold,
+            configured_by=actor.id,
+            configured_at=datetime.now(timezone.utc),
         )
-        return item
+        return self.config_repo.create(config)
 
-    def receive_returned_part(self, scanned_barcode: str, actor: User, notes: str | None = None) -> InventoryItem:
-        """
-        Process a returned part by barcode scan.
-        Only moderator/owner can receive returns.
-        """
-        if actor.role == UserRole.staff:
-            raise PermissionDeniedError("Staff cannot receive returned parts.")
+    def update_low_stock_config(self, config_id: UUID, payload: LowStockConfigUpdate, actor: User) -> LowStockConfig:
+        config = self.config_repo.get_by_id(config_id)
+        if not config:
+            raise NotFoundError("LowStockConfig", str(config_id))
+        config.threshold = payload.threshold
+        config.configured_by = actor.id
+        config.configured_at = datetime.now(timezone.utc)
+        return self.config_repo.save(config)
 
-        item = self.repo.get_by_barcode(scanned_barcode)
-        if not item:
-            raise NotFoundError("InventoryItem", f"barcode={scanned_barcode}")
+    def delete_low_stock_config(self, config_id: UUID) -> None:
+        config = self.config_repo.get_by_id(config_id)
+        if not config:
+            raise NotFoundError("LowStockConfig", str(config_id))
+        self.db.delete(config)
+        self.db.flush()
 
-        if item.status != InventoryItemStatus.PENDING_RETURN:
-            raise BusinessRuleError(
-                "ITEM_NOT_PENDING_RETURN",
-                f"Item status is {item.status.value}, expected PENDING_RETURN.",
-            )
+    # ── Bulk Import ───────────────────────────────────────────────────────────
 
-        ticket_id = item.current_ticket_id
-        item.status = InventoryItemStatus.CONSUMED
-        item.returned_at = datetime.now(timezone.utc)
-        item.received_by = actor.id
-        self.repo.save(item)
-        self._record_movement(
-            item, InventoryItemStatus.PENDING_RETURN, InventoryItemStatus.CONSUMED, actor, ticket_id, notes
-        )
+    def bulk_import_csv(self, csv_content: bytes, actor: User) -> dict:
+        text = csv_content.decode("utf-8-sig")
+        reader = csv.DictReader(io.StringIO(text))
+        created = 0
+        updated = 0
+        errors: list[dict] = []
 
-        # Check if all parts for the parent ticket are reconciled
-        if ticket_id:
-            remaining = self.repo.list_checked_out_for_ticket(ticket_id)
-            if not remaining:
-                from app.services.notification_service import NotificationService
-                NotificationService(self.db).notify_parts_dispatched(str(ticket_id))
+        for row_num, raw in enumerate(reader, start=2):
+            try:
+                row = BulkImportRow(
+                    part_name=raw.get("part_name", "").strip(),
+                    part_number=raw.get("part_number", "").strip(),
+                    category_name=raw.get("category_name", "").strip() or None,
+                    barcode=raw.get("barcode", "").strip() or None,
+                    unit_cost=Decimal(raw.get("unit_cost", "0") or "0"),
+                    quantity=int(raw.get("quantity", 0) or 0),
+                    low_stock_threshold=int(raw.get("low_stock_threshold", 10) or 10),
+                )
+            except Exception as e:
+                errors.append({"row": row_num, "error": str(e)})
+                continue
 
-        return item
+            # Resolve category
+            category_id = None
+            if row.category_name:
+                cat = self.cat_repo.get_by_name(row.category_name)
+                if not cat:
+                    cat = InventoryCategory(category_name=row.category_name)
+                    self.cat_repo.create(cat)
+                category_id = cat.id
 
-    def _record_movement(
-        self,
-        item: InventoryItem,
-        from_status: InventoryItemStatus | None,
-        to_status: InventoryItemStatus,
-        actor: User,
-        ticket_id: UUID | None,
-        notes: str | None = None,
-    ) -> None:
-        movement = InventoryMovement(
-            item_id=item.id,
-            from_status=from_status.value if from_status else None,
-            to_status=to_status.value,
-            ticket_id=ticket_id,
-            actor_id=actor.id,
-            notes=notes,
-            timestamp=datetime.now(timezone.utc),
-        )
-        self.repo.add_movement(movement)
+            existing = self.inv_repo.get_by_part_number(row.part_number)
+            if existing:
+                existing.part_name = row.part_name
+                existing.category_id = category_id
+                existing.barcode = row.barcode
+                existing.unit_cost = row.unit_cost
+                existing.quantity = row.quantity
+                existing.low_stock_threshold = row.low_stock_threshold
+                self.inv_repo.save(existing)
+                updated += 1
+            else:
+                item = InventoryItem(
+                    part_name=row.part_name,
+                    part_number=row.part_number,
+                    category_id=category_id,
+                    barcode=row.barcode,
+                    unit_cost=row.unit_cost,
+                    quantity=row.quantity,
+                    low_stock_threshold=row.low_stock_threshold,
+                )
+                self.inv_repo.create(item)
+                created += 1
+
+        return {"created": created, "updated": updated, "errors": errors}

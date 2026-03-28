@@ -31,10 +31,10 @@ def owner_dashboard(db: Session = Depends(get_db)):
     - Accessible by: owner only.
     """
     from datetime import datetime, timezone
-    from sqlalchemy import func, distinct
+    from sqlalchemy import func
     from app.models.ticket import Ticket, TicketStatus
     from app.models.user import User, UserRole
-    from app.models.inventory import InventoryItem, InventoryItemStatus, InventoryStock
+    from app.models.inventory import InventoryItem
     from app.models.payroll import SalaryRecord, SalaryStatus
     from app.models.dg_set import DGSet
 
@@ -84,26 +84,20 @@ def owner_dashboard(db: Session = Depends(get_db)):
     )
 
     # ── Inventory ──────────────────────────────────────────────────────────────
-    # Total distinct part types (serialized items by part_name)
+    # Total distinct part types and total quantity in stock
     total_item_types = (
-        db.query(func.count(distinct(InventoryItem.part_name)))
-        .filter(InventoryItem.is_deleted.is_(False))
-        .scalar() or 0
-    )
-    total_items = (
         db.query(func.count(InventoryItem.id))
         .filter(InventoryItem.is_deleted.is_(False))
         .scalar() or 0
     )
-
-    # Per-status breakdown
-    inv_status_rows = (
-        db.query(InventoryItem.status, func.count(InventoryItem.id))
+    total_quantity = (
+        db.query(func.coalesce(func.sum(InventoryItem.quantity), 0))
         .filter(InventoryItem.is_deleted.is_(False))
-        .group_by(InventoryItem.status)
-        .all()
+        .scalar() or 0
     )
-    inv_by_status = {row[0].value: row[1] for row in inv_status_rows}
+    low_stock_count = inv_repo.count_filtered(
+        category_id=None, search=None, low_stock_only=True
+    )
 
     # ── Overdue AMC ────────────────────────────────────────────────────────────
     overdue_amc = (
@@ -175,9 +169,8 @@ def owner_dashboard(db: Session = Depends(get_db)):
         "total_tickets": total_tickets,
         # Inventory
         "total_item_types": total_item_types,
-        "total_items": total_items,
-        "parts_in_field": inv_repo.count_in_field(),
-        "inventory_by_status": inv_by_status,
+        "total_quantity_in_stock": int(total_quantity),
+        "low_stock_items": low_stock_count,
         # Overdue AMC
         "overdue_amc": overdue_amc,
         # Payroll (current month)
@@ -219,13 +212,15 @@ def moderator_dashboard(db: Session = Depends(get_db)):
         .count()
     )
 
-    low_stock = inv_repo.list_low_stock(db)
+    low_stock_count = inv_repo.count_filtered(
+        category_id=None, search=None, low_stock_only=True
+    )
 
     return {
         "open_tickets": ticket_repo.count_open(),
         "assigned_today": assigned_today,
         "pending_attendance": att_repo.count_pending(),
-        "low_stock_items": len(low_stock),
+        "low_stock_items": low_stock_count,
     }
 
 

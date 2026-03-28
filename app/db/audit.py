@@ -33,7 +33,7 @@ def _get_model_state(instance) -> dict[str, Any]:
     return result
 
 
-_AUDITED_TABLES = {"tickets", "inventory_items", "attendance", "tenders"}
+_AUDITED_TABLES = {"tickets", "inventory_items", "inventory_categories", "attendance", "tenders"}
 
 
 def _write_audit_log(

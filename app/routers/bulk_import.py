@@ -67,6 +67,27 @@ async def import_inventory(
     return log
 
 
+@router.post("/categories", response_model=BulkImportResponse)
+async def import_categories(
+    file: UploadFile = File(..., description="Excel (.xlsx), CSV (.csv) or JSON (.json) file"),
+    current_user=Depends(require_role("owner", "moderator")),
+    db: Session = Depends(get_db),
+):
+    """
+    Bulk-import inventory categories from a file.
+
+    - Existing categories (matched by name) are updated (upsert).
+    - New categories are created automatically.
+    - Partial imports are supported.
+    - Accepted formats: .xlsx, .csv, .json
+
+    Accessible by: owner, moderator.
+    """
+    service = BulkImportService(db)
+    log = await service.import_categories(file, current_user)
+    return log
+
+
 # ── Static GET routes MUST come before /{import_id} to avoid route shadowing ──
 
 @router.get("/format-reference", include_in_schema=True)
@@ -90,11 +111,15 @@ def format_reference(
         ],
         "inventory": [
             {"column": "part_name",   "type": "string",  "required": True,  "notes": "Descriptive name of the part"},
-            {"column": "part_number", "type": "string",  "required": True,  "notes": "Internal part number"},
-            {"column": "serial_no",   "type": "string",  "required": False, "notes": "Must be globally unique if provided"},
+            {"column": "part_number", "type": "string",  "required": True,  "notes": "Internal part number, must be unique"},
+            {"column": "category",    "type": "string",  "required": False, "notes": "Category name — created automatically if it does not exist"},
             {"column": "barcode",     "type": "string",  "required": False, "notes": "Must be globally unique if provided"},
-            {"column": "description", "type": "string",  "required": False, "notes": "Optional free-text description"},
+            {"column": "quantity",    "type": "integer", "required": False, "notes": "Stock quantity, defaults to 0"},
             {"column": "unit_cost",   "type": "decimal", "required": False, "notes": "Cost in INR, defaults to 0.00"},
+        ],
+        "categories": [
+            {"column": "category_name", "type": "string", "required": True,  "notes": "Name of the category — upserted if it already exists"},
+            {"column": "description",   "type": "string", "required": False, "notes": "Optional description of the category"},
         ],
     }
 
@@ -130,6 +155,23 @@ def download_inventory_template(
         content=BulkImportService.get_inventory_template_csv(),
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=inventory_import_template.csv"},
+    )
+
+
+@router.get("/templates/categories", response_class=PlainTextResponse)
+def download_categories_template(
+    current_user=Depends(require_role("owner", "moderator")),
+):
+    """
+    Download the CSV template for category imports.
+
+    Includes column headers, an example row, and instructions.
+    Accessible by: owner, moderator.
+    """
+    return PlainTextResponse(
+        content=BulkImportService.get_categories_template_csv(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=categories_import_template.csv"},
     )
 
 

@@ -1,19 +1,62 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone, timedelta
 from uuid import UUID
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.models.inventory import InventoryItem, InventoryItemStatus, InventoryMovement, InventoryStock
+from app.models.inventory import (
+    InventoryCategory,
+    InventoryItem,
+    LowStockConfig,
+)
 from app.repositories.base import BaseRepository
+
+
+class CategoryRepository(BaseRepository[InventoryCategory]):
+    model = InventoryCategory
+
+    def get_by_name(self, name: str) -> InventoryCategory | None:
+        return (
+            self.db.query(InventoryCategory)
+            .filter(InventoryCategory.category_name == name, InventoryCategory.is_deleted.is_(False))
+            .first()
+        )
+
+    def item_count(self, category_id: UUID) -> int:
+        return (
+            self.db.query(InventoryItem)
+            .filter(
+                InventoryItem.category_id == category_id,
+                InventoryItem.is_deleted.is_(False),
+            )
+            .count()
+        )
+
+    def list_all_with_counts(self) -> list[tuple[InventoryCategory, int]]:
+        rows = (
+            self.db.query(InventoryCategory, func.count(InventoryItem.id).label("cnt"))
+            .outerjoin(
+                InventoryItem,
+                (InventoryItem.category_id == InventoryCategory.id) & (InventoryItem.is_deleted.is_(False)),
+            )
+            .filter(InventoryCategory.is_deleted.is_(False))
+            .group_by(InventoryCategory.id)
+            .order_by(InventoryCategory.category_name)
+            .all()
+        )
+        return [(cat, cnt) for cat, cnt in rows]
 
 
 class InventoryRepository(BaseRepository[InventoryItem]):
     model = InventoryItem
 
-    def __init__(self, db: Session) -> None:
-        super().__init__(db)
+    def get_by_part_number(self, part_number: str) -> InventoryItem | None:
+        return (
+            self.db.query(InventoryItem)
+            .filter(InventoryItem.part_number == part_number, InventoryItem.is_deleted.is_(False))
+            .first()
+        )
 
     def get_by_barcode(self, barcode: str) -> InventoryItem | None:
         return (
@@ -22,61 +65,63 @@ class InventoryRepository(BaseRepository[InventoryItem]):
             .first()
         )
 
-    def get_by_serial(self, serial_no: str) -> InventoryItem | None:
+    def list_filtered(
+        self,
+        skip: int = 0,
+        limit: int = 20,
+        category_id: UUID | None = None,
+        search: str | None = None,
+        low_stock_only: bool = False,
+    ) -> list[InventoryItem]:
+        q = self.db.query(InventoryItem).filter(InventoryItem.is_deleted.is_(False))
+        if category_id:
+            q = q.filter(InventoryItem.category_id == category_id)
+        if search:
+            pattern = f"%{search}%"
+            q = q.filter(
+                InventoryItem.part_name.ilike(pattern) | InventoryItem.part_number.ilike(pattern)
+            )
+        if low_stock_only:
+            # quantity <= low_stock_threshold (uses item-level threshold; config override handled in service)
+            q = q.filter(InventoryItem.quantity <= InventoryItem.low_stock_threshold)
+        return q.order_by(InventoryItem.part_name).offset(skip).limit(limit).all()
+
+    def count_filtered(
+        self,
+        category_id: UUID | None = None,
+        search: str | None = None,
+        low_stock_only: bool = False,
+    ) -> int:
+        q = self.db.query(InventoryItem).filter(InventoryItem.is_deleted.is_(False))
+        if category_id:
+            q = q.filter(InventoryItem.category_id == category_id)
+        if search:
+            pattern = f"%{search}%"
+            q = q.filter(
+                InventoryItem.part_name.ilike(pattern) | InventoryItem.part_number.ilike(pattern)
+            )
+        if low_stock_only:
+            q = q.filter(InventoryItem.quantity <= InventoryItem.low_stock_threshold)
+        return q.count()
+
+    def list_low_stock(self) -> list[InventoryItem]:
         return (
             self.db.query(InventoryItem)
-            .filter(InventoryItem.serial_no == serial_no, InventoryItem.is_deleted.is_(False))
+            .filter(
+                InventoryItem.is_deleted.is_(False),
+                InventoryItem.quantity <= InventoryItem.low_stock_threshold,
+            )
+            .order_by(InventoryItem.quantity)
+            .all()
+        )
+
+
+class LowStockConfigRepository(BaseRepository[LowStockConfig]):
+    model = LowStockConfig
+
+    def get_by_item(self, item_id: UUID) -> LowStockConfig | None:
+        return (
+            self.db.query(LowStockConfig)
+            .filter(LowStockConfig.inventory_item_id == item_id)
             .first()
-        )
-
-    def list_checked_out_for_ticket(self, ticket_id: UUID) -> list[InventoryItem]:
-        return (
-            self.db.query(InventoryItem)
-            .filter(
-                InventoryItem.current_ticket_id == ticket_id,
-                InventoryItem.status == InventoryItemStatus.CHECKED_OUT,
-                InventoryItem.is_deleted.is_(False),
-            )
-            .all()
-        )
-
-    def list_overdue_checkouts(self, hours: int = 48) -> list[InventoryItem]:
-        """Return items checked out for more than `hours` hours."""
-        threshold = datetime.now(timezone.utc) - timedelta(hours=hours)
-        return (
-            self.db.query(InventoryItem)
-            .filter(
-                InventoryItem.status == InventoryItemStatus.CHECKED_OUT,
-                InventoryItem.checked_out_at <= threshold,
-                InventoryItem.is_deleted.is_(False),
-            )
-            .all()
-        )
-
-    def count_in_field(self) -> int:
-        return (
-            self.db.query(InventoryItem)
-            .filter(
-                InventoryItem.status.in_([
-                    InventoryItemStatus.CHECKED_OUT,
-                    InventoryItemStatus.PENDING_RETURN,
-                ]),
-                InventoryItem.is_deleted.is_(False),
-            )
-            .count()
-        )
-
-    def add_movement(self, movement: InventoryMovement) -> InventoryMovement:
-        self.db.add(movement)
-        self.db.flush()
-        return movement
-
-    def list_low_stock(self, db: Session) -> list[InventoryStock]:
-        return (
-            db.query(InventoryStock)
-            .filter(
-                InventoryStock.quantity_in_stock <= InventoryStock.reorder_level,
-                InventoryStock.is_deleted.is_(False),
-            )
-            .all()
         )

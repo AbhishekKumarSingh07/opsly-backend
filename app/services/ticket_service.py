@@ -33,8 +33,8 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
         TicketStatus.CANCELLED,
     ],
     TicketStatus.WAITING_FOR_PARTS: [TicketStatus.IN_PROGRESS, TicketStatus.CANCELLED],
-    TicketStatus.COMPLETED: [TicketStatus.INVOICED, TicketStatus.CANCELLED],
-    TicketStatus.INVOICED: [TicketStatus.CLOSED if hasattr(TicketStatus, "CLOSED") else TicketStatus.CANCELLED],
+    TicketStatus.COMPLETED: [TicketStatus.INVOICED, TicketStatus.CLOSED, TicketStatus.CANCELLED],
+    TicketStatus.INVOICED: [TicketStatus.CLOSED],
     TicketStatus.CANCELLED: [],
 }
 
@@ -42,6 +42,7 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
 MODERATOR_ONLY_TRANSITIONS: set[TicketStatus] = {
     TicketStatus.ASSIGNED,
     TicketStatus.INVOICED,
+    TicketStatus.CLOSED,
     TicketStatus.CANCELLED,
 }
 
@@ -115,7 +116,7 @@ class TicketService:
         self._validate_transition(ticket, new_status, user)
 
         if new_status == TicketStatus.COMPLETED:
-            self._validate_completion(ticket)
+            self._validate_completion(ticket, user)
 
         if new_status == TicketStatus.COMPLETED:
             ticket.completed_at = datetime.now(timezone.utc)
@@ -180,8 +181,13 @@ class TicketService:
                 f"Only moderator/owner can set status to {new_status.value}."
             )
 
-    def _validate_completion(self, ticket: Ticket) -> None:
-        """Enforce completion requirements before marking a ticket COMPLETED."""
+    def _validate_completion(self, ticket: Ticket, user: User) -> None:
+        """Enforce completion requirements before marking a ticket COMPLETED.
+        Owners and moderators can bypass photo requirements."""
+        # Owners/moderators can force-complete without photo requirements
+        if user.role in (UserRole.owner, UserRole.moderator):
+            return
+
         after_photos = self.repo.get_photos_by_type(ticket.id, PhotoType.AFTER)
         if not after_photos:
             raise BusinessRuleError(

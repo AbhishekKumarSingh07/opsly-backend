@@ -7,8 +7,8 @@ from sqlalchemy.orm import Session
 
 from app.models.inventory import (
     InventoryCategory,
+    InventoryDispatch,
     InventoryItem,
-    LowStockConfig,
 )
 from app.repositories.base import BaseRepository
 
@@ -52,6 +52,8 @@ class InventoryRepository(BaseRepository[InventoryItem]):
     model = InventoryItem
 
     def get_by_part_number(self, part_number: str) -> InventoryItem | None:
+        if not part_number:
+            return None
         return (
             self.db.query(InventoryItem)
             .filter(InventoryItem.part_number == part_number, InventoryItem.is_deleted.is_(False))
@@ -79,10 +81,11 @@ class InventoryRepository(BaseRepository[InventoryItem]):
         if search:
             pattern = f"%{search}%"
             q = q.filter(
-                InventoryItem.part_name.ilike(pattern) | InventoryItem.part_number.ilike(pattern)
+                InventoryItem.part_name.ilike(pattern)
+                | InventoryItem.part_number.ilike(pattern)
+                | InventoryItem.barcode.ilike(pattern)
             )
         if low_stock_only:
-            # quantity <= low_stock_threshold (uses item-level threshold; config override handled in service)
             q = q.filter(InventoryItem.quantity <= InventoryItem.low_stock_threshold)
         return q.order_by(InventoryItem.part_name).offset(skip).limit(limit).all()
 
@@ -98,7 +101,9 @@ class InventoryRepository(BaseRepository[InventoryItem]):
         if search:
             pattern = f"%{search}%"
             q = q.filter(
-                InventoryItem.part_name.ilike(pattern) | InventoryItem.part_number.ilike(pattern)
+                InventoryItem.part_name.ilike(pattern)
+                | InventoryItem.part_number.ilike(pattern)
+                | InventoryItem.barcode.ilike(pattern)
             )
         if low_stock_only:
             q = q.filter(InventoryItem.quantity <= InventoryItem.low_stock_threshold)
@@ -116,12 +121,39 @@ class InventoryRepository(BaseRepository[InventoryItem]):
         )
 
 
-class LowStockConfigRepository(BaseRepository[LowStockConfig]):
-    model = LowStockConfig
+class InventoryDispatchRepository(BaseRepository[InventoryDispatch]):
+    model = InventoryDispatch
 
-    def get_by_item(self, item_id: UUID) -> LowStockConfig | None:
+    def list_by_item(
+        self, item_id: UUID, skip: int = 0, limit: int = 50
+    ) -> list[InventoryDispatch]:
         return (
-            self.db.query(LowStockConfig)
-            .filter(LowStockConfig.inventory_item_id == item_id)
-            .first()
+            self.db.query(InventoryDispatch)
+            .filter(InventoryDispatch.inventory_item_id == item_id)
+            .order_by(InventoryDispatch.dispatched_at.desc())
+            .offset(skip)
+            .limit(limit)
+            .all()
         )
+
+    def list_by_ticket(self, ticket_id: UUID) -> list[InventoryDispatch]:
+        return (
+            self.db.query(InventoryDispatch)
+            .filter(InventoryDispatch.ticket_id == ticket_id)
+            .order_by(InventoryDispatch.dispatched_at.desc())
+            .all()
+        )
+
+    def list_by_category(
+        self, category_id: UUID, skip: int = 0, limit: int = 50
+    ) -> list[InventoryDispatch]:
+        return (
+            self.db.query(InventoryDispatch)
+            .join(InventoryItem, InventoryDispatch.inventory_item_id == InventoryItem.id)
+            .filter(InventoryItem.category_id == category_id)
+            .order_by(InventoryDispatch.dispatched_at.desc())
+            .offset(skip)
+            .limit(limit)
+            .all()
+        )
+

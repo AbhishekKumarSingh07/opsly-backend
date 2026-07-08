@@ -6,22 +6,23 @@ from fastapi import APIRouter, Depends, File, Query, UploadFile
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import get_current_user, get_db, require_role
+from app.core.exceptions import NotFoundError
 from app.repositories.inventory_repo import (
     CategoryRepository,
+    InventoryDispatchRepository,
     InventoryRepository,
-    LowStockConfigRepository,
 )
 from app.schemas.common import PaginatedResponse
 from app.schemas.inventory import (
     CategoryCreate,
     CategoryResponse,
     CategoryUpdate,
+    InventoryDispatchCreate,
+    InventoryDispatchResponse,
+    InventoryDispatchReturn,
     InventoryItemCreate,
     InventoryItemResponse,
     InventoryItemUpdate,
-    LowStockConfigCreate,
-    LowStockConfigResponse,
-    LowStockConfigUpdate,
 )
 from app.services.inventory_service import InventoryService
 from app.utils.pagination import paginate, page_offset
@@ -44,6 +45,29 @@ def _item_response(item) -> InventoryItemResponse:
         is_low_stock=item.is_low_stock,
         created_at=item.created_at,
         updated_at=item.updated_at,
+    )
+
+
+def _dispatch_response(d) -> InventoryDispatchResponse:
+    item = d.inventory_item
+    ticket = d.ticket
+    return InventoryDispatchResponse(
+        id=d.id,
+        inventory_item_id=d.inventory_item_id,
+        ticket_id=d.ticket_id,
+        quantity=d.quantity,
+        dispatched_by=d.dispatched_by,
+        dispatched_at=d.dispatched_at,
+        part_number_dispatched=d.part_number_dispatched,
+        barcode_dispatched=d.barcode_dispatched,
+        notes=d.notes,
+        returned_quantity=d.returned_quantity,
+        returned_by=d.returned_by,
+        returned_at=d.returned_at,
+        created_at=d.created_at,
+        updated_at=d.updated_at,
+        item_name=item.part_name if item else None,
+        ticket_ref=ticket.reference_no if ticket else None,
     )
 
 
@@ -116,12 +140,24 @@ def delete_category(
     InventoryService(db).delete_category(cat_id, current_user)
 
 
+@router.get("/categories/{cat_id}/dispatch-history", response_model=list[InventoryDispatchResponse])
+def category_dispatch_history(
+    cat_id: UUID,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    _=Depends(require_role("owner", "moderator")),
+    db: Session = Depends(get_db),
+):
+    dispatches = InventoryDispatchRepository(db).list_by_category(cat_id, skip=skip, limit=limit)
+    return [_dispatch_response(d) for d in dispatches]
+
+
 # ── Inventory Items ───────────────────────────────────────────────────────────
 
 @router.post("/", response_model=InventoryItemResponse)
 def create_item(
     payload: InventoryItemCreate,
-    current_user=Depends(require_role("owner", "moderator")),
+    current_user=Depends(require_role("owner")),
     db: Session = Depends(get_db),
 ):
     return _item_response(InventoryService(db).create_item(payload, current_user))
@@ -139,8 +175,13 @@ def list_inventory(
 ):
     repo = InventoryRepository(db)
     skip, limit = page_offset(page, page_size)
-    items = repo.list_filtered(skip=skip, limit=limit, category_id=category_id, search=search, low_stock_only=low_stock_only)
-    total = repo.count_filtered(category_id=category_id, search=search, low_stock_only=low_stock_only)
+    items = repo.list_filtered(
+        skip=skip, limit=limit,
+        category_id=category_id, search=search, low_stock_only=low_stock_only,
+    )
+    total = repo.count_filtered(
+        category_id=category_id, search=search, low_stock_only=low_stock_only,
+    )
     return paginate([_item_response(i) for i in items], total=total, page=page, page_size=page_size)
 
 
@@ -168,7 +209,6 @@ def get_item(
     _=Depends(require_role("owner", "moderator")),
     db: Session = Depends(get_db),
 ):
-    from app.core.exceptions import NotFoundError
     item = InventoryRepository(db).get_by_id(item_id)
     if not item or item.is_deleted:
         raise NotFoundError("InventoryItem", str(item_id))
@@ -179,7 +219,7 @@ def get_item(
 def update_item(
     item_id: UUID,
     payload: InventoryItemUpdate,
-    current_user=Depends(require_role("owner", "moderator")),
+    current_user=Depends(require_role("owner")),
     db: Session = Depends(get_db),
 ):
     return _item_response(InventoryService(db).update_item(item_id, payload, current_user))
@@ -194,74 +234,47 @@ def delete_item(
     InventoryService(db).delete_item(item_id, current_user)
 
 
-# ── Low Stock Config ──────────────────────────────────────────────────────────
-
-@router.get("/low-stock-config", response_model=list[LowStockConfigResponse])
-def list_low_stock_configs(
-    _=Depends(require_role("owner")),
+@router.get("/{item_id}/dispatch-history", response_model=list[InventoryDispatchResponse])
+def item_dispatch_history(
+    item_id: UUID,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    _=Depends(require_role("owner", "moderator")),
     db: Session = Depends(get_db),
 ):
-    configs = db.query(__import__("app.models.inventory", fromlist=["LowStockConfig"]).LowStockConfig).all()
-    result = []
-    for c in configs:
-        item = c.inventory_item
-        result.append(LowStockConfigResponse(
-            id=c.id,
-            inventory_item_id=c.inventory_item_id,
-            part_number=item.part_number if item else None,
-            part_name=item.part_name if item else None,
-            threshold=c.threshold,
-            configured_by=c.configured_by,
-            configured_at=c.configured_at,
-        ))
-    return result
+    dispatches = InventoryDispatchRepository(db).list_by_item(item_id, skip=skip, limit=limit)
+    return [_dispatch_response(d) for d in dispatches]
 
 
-@router.post("/low-stock-config", response_model=LowStockConfigResponse)
-def set_low_stock_config(
-    payload: LowStockConfigCreate,
-    current_user=Depends(require_role("owner")),
+# ── Dispatch ──────────────────────────────────────────────────────────────────
+
+@router.post("/dispatches/create", response_model=InventoryDispatchResponse)
+def dispatch_item(
+    payload: InventoryDispatchCreate,
+    current_user=Depends(require_role("owner", "moderator")),
     db: Session = Depends(get_db),
 ):
-    svc = InventoryService(db)
-    c = svc.set_low_stock_config(payload, current_user)
-    item = c.inventory_item
-    return LowStockConfigResponse(
-        id=c.id,
-        inventory_item_id=c.inventory_item_id,
-        part_number=item.part_number if item else None,
-        part_name=item.part_name if item else None,
-        threshold=c.threshold,
-        configured_by=c.configured_by,
-        configured_at=c.configured_at,
-    )
+    dispatch = InventoryService(db).dispatch_item(payload, current_user)
+    return _dispatch_response(dispatch)
 
 
-@router.put("/low-stock-config/{config_id}", response_model=LowStockConfigResponse)
-def update_low_stock_config(
-    config_id: UUID,
-    payload: LowStockConfigUpdate,
-    current_user=Depends(require_role("owner")),
+@router.get("/dispatches/ticket/{ticket_id}", response_model=list[InventoryDispatchResponse])
+def ticket_dispatches(
+    ticket_id: UUID,
+    _=Depends(require_role("owner", "moderator")),
     db: Session = Depends(get_db),
 ):
-    svc = InventoryService(db)
-    c = svc.update_low_stock_config(config_id, payload, current_user)
-    item = c.inventory_item
-    return LowStockConfigResponse(
-        id=c.id,
-        inventory_item_id=c.inventory_item_id,
-        part_number=item.part_number if item else None,
-        part_name=item.part_name if item else None,
-        threshold=c.threshold,
-        configured_by=c.configured_by,
-        configured_at=c.configured_at,
-    )
+    dispatches = InventoryDispatchRepository(db).list_by_ticket(ticket_id)
+    return [_dispatch_response(d) for d in dispatches]
 
 
-@router.delete("/low-stock-config/{config_id}", status_code=204)
-def delete_low_stock_config(
-    config_id: UUID,
-    _=Depends(require_role("owner")),
+@router.post("/dispatches/{dispatch_id}/return", response_model=InventoryDispatchResponse)
+def return_item(
+    dispatch_id: UUID,
+    payload: InventoryDispatchReturn,
+    current_user=Depends(require_role("owner", "moderator")),
     db: Session = Depends(get_db),
 ):
-    InventoryService(db).delete_low_stock_config(config_id)
+    dispatch = InventoryService(db).return_item(dispatch_id, payload, current_user)
+    return _dispatch_response(dispatch)
+

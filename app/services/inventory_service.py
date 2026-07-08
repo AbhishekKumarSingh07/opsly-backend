@@ -11,23 +11,23 @@ from sqlalchemy.orm import Session
 from app.core.exceptions import BusinessRuleError, ConflictError, NotFoundError
 from app.models.inventory import (
     InventoryCategory,
+    InventoryDispatch,
     InventoryItem,
-    LowStockConfig,
 )
 from app.models.user import User
 from app.repositories.inventory_repo import (
     CategoryRepository,
+    InventoryDispatchRepository,
     InventoryRepository,
-    LowStockConfigRepository,
 )
 from app.schemas.inventory import (
     BulkImportRow,
     CategoryCreate,
     CategoryUpdate,
+    InventoryDispatchCreate,
+    InventoryDispatchReturn,
     InventoryItemCreate,
     InventoryItemUpdate,
-    LowStockConfigCreate,
-    LowStockConfigUpdate,
 )
 
 
@@ -36,7 +36,7 @@ class InventoryService:
         self.db = db
         self.cat_repo = CategoryRepository(db)
         self.inv_repo = InventoryRepository(db)
-        self.config_repo = LowStockConfigRepository(db)
+        self.dispatch_repo = InventoryDispatchRepository(db)
 
     # ── Categories ──────────────────────────────────────────────────────────
 
@@ -76,13 +76,15 @@ class InventoryService:
     # ── Inventory Items ──────────────────────────────────────────────────────
 
     def create_item(self, payload: InventoryItemCreate, actor: User) -> InventoryItem:
-        if self.inv_repo.get_by_part_number(payload.part_number):
-            raise ConflictError(f"Part number '{payload.part_number}' already exists.")
+        # Only check part_number uniqueness if provided
+        if payload.part_number:
+            if self.inv_repo.get_by_part_number(payload.part_number):
+                raise ConflictError(f"Part number '{payload.part_number}' already exists.")
         if payload.barcode and self.inv_repo.get_by_barcode(payload.barcode):
             raise ConflictError(f"Barcode '{payload.barcode}' already exists.")
         item = InventoryItem(
             part_name=payload.part_name,
-            part_number=payload.part_number,
+            part_number=payload.part_number or None,
             category_id=payload.category_id,
             barcode=payload.barcode or None,
             unit_cost=payload.unit_cost,
@@ -95,10 +97,16 @@ class InventoryService:
         item = self.inv_repo.get_by_id(item_id)
         if not item or item.is_deleted:
             raise NotFoundError("InventoryItem", str(item_id))
+        # part_number uniqueness check (only if changing to a non-None value)
+        if payload.part_number is not None and payload.part_number != item.part_number:
+            existing = self.inv_repo.get_by_part_number(payload.part_number)
+            if existing and existing.id != item_id:
+                raise ConflictError(f"Part number '{payload.part_number}' already exists.")
         if payload.barcode and payload.barcode != item.barcode:
             if self.inv_repo.get_by_barcode(payload.barcode):
                 raise ConflictError(f"Barcode '{payload.barcode}' already exists.")
-        for field in ("part_name", "category_id", "barcode", "unit_cost", "quantity", "low_stock_threshold"):
+        for field in ("part_name", "part_number", "category_id", "barcode",
+                      "unit_cost", "quantity", "low_stock_threshold"):
             val = getattr(payload, field, None)
             if val is not None:
                 setattr(item, field, val)
@@ -111,41 +119,57 @@ class InventoryService:
         item.is_deleted = True
         self.inv_repo.save(item)
 
-    # ── Low Stock Config ──────────────────────────────────────────────────────
+    # ── Dispatch ──────────────────────────────────────────────────────────────
 
-    def set_low_stock_config(self, payload: LowStockConfigCreate, actor: User) -> LowStockConfig:
+    def dispatch_item(self, payload: InventoryDispatchCreate, actor: User) -> InventoryDispatch:
         item = self.inv_repo.get_by_id(payload.inventory_item_id)
         if not item or item.is_deleted:
             raise NotFoundError("InventoryItem", str(payload.inventory_item_id))
-        existing = self.config_repo.get_by_item(payload.inventory_item_id)
-        if existing:
-            existing.threshold = payload.threshold
-            existing.configured_by = actor.id
-            existing.configured_at = datetime.now(timezone.utc)
-            return self.config_repo.save(existing)
-        config = LowStockConfig(
+        net_dispatched = payload.quantity
+        if item.quantity < net_dispatched:
+            raise BusinessRuleError(
+                "INSUFFICIENT_STOCK",
+                f"Cannot dispatch {net_dispatched} units — only {item.quantity} in stock.",
+            )
+        # Reduce quantity
+        item.quantity -= net_dispatched
+        self.inv_repo.save(item)
+
+        dispatch = InventoryDispatch(
             inventory_item_id=payload.inventory_item_id,
-            threshold=payload.threshold,
-            configured_by=actor.id,
-            configured_at=datetime.now(timezone.utc),
+            ticket_id=payload.ticket_id,
+            quantity=payload.quantity,
+            dispatched_by=actor.id,
+            dispatched_at=datetime.now(timezone.utc),
+            part_number_dispatched=item.part_number,
+            barcode_dispatched=item.barcode,
+            notes=payload.notes,
+            returned_quantity=0,
         )
-        return self.config_repo.create(config)
+        return self.dispatch_repo.create(dispatch)
 
-    def update_low_stock_config(self, config_id: UUID, payload: LowStockConfigUpdate, actor: User) -> LowStockConfig:
-        config = self.config_repo.get_by_id(config_id)
-        if not config:
-            raise NotFoundError("LowStockConfig", str(config_id))
-        config.threshold = payload.threshold
-        config.configured_by = actor.id
-        config.configured_at = datetime.now(timezone.utc)
-        return self.config_repo.save(config)
+    def return_item(
+        self, dispatch_id: UUID, payload: InventoryDispatchReturn, actor: User
+    ) -> InventoryDispatch:
+        dispatch = self.dispatch_repo.get_by_id(dispatch_id)
+        if not dispatch:
+            raise NotFoundError("InventoryDispatch", str(dispatch_id))
+        max_returnable = dispatch.quantity - dispatch.returned_quantity
+        if payload.returned_quantity > max_returnable:
+            raise BusinessRuleError(
+                "RETURN_EXCEEDS_DISPATCHED",
+                f"Cannot return {payload.returned_quantity} — only {max_returnable} eligible for return.",
+            )
+        # Restore quantity
+        item = self.inv_repo.get_by_id(dispatch.inventory_item_id)
+        if item and not item.is_deleted:
+            item.quantity += payload.returned_quantity
+            self.inv_repo.save(item)
 
-    def delete_low_stock_config(self, config_id: UUID) -> None:
-        config = self.config_repo.get_by_id(config_id)
-        if not config:
-            raise NotFoundError("LowStockConfig", str(config_id))
-        self.db.delete(config)
-        self.db.flush()
+        dispatch.returned_quantity += payload.returned_quantity
+        dispatch.returned_by = actor.id
+        dispatch.returned_at = datetime.now(timezone.utc)
+        return self.dispatch_repo.save(dispatch)
 
     # ── Bulk Import ───────────────────────────────────────────────────────────
 
@@ -158,9 +182,10 @@ class InventoryService:
 
         for row_num, raw in enumerate(reader, start=2):
             try:
+                raw_part_number = raw.get("part_number", "").strip() or None
                 row = BulkImportRow(
                     part_name=raw.get("part_name", "").strip(),
-                    part_number=raw.get("part_number", "").strip(),
+                    part_number=raw_part_number,
                     category_name=raw.get("category_name", "").strip() or None,
                     barcode=raw.get("barcode", "").strip() or None,
                     unit_cost=Decimal(raw.get("unit_cost", "0") or "0"),
@@ -180,11 +205,20 @@ class InventoryService:
                     self.cat_repo.create(cat)
                 category_id = cat.id
 
-            existing = self.inv_repo.get_by_part_number(row.part_number)
+            # Try to match by part_number (if provided) or barcode
+            existing = None
+            if row.part_number:
+                existing = self.inv_repo.get_by_part_number(row.part_number)
+            if not existing and row.barcode:
+                existing = self.inv_repo.get_by_barcode(row.barcode)
+
             if existing:
                 existing.part_name = row.part_name
+                if row.part_number:
+                    existing.part_number = row.part_number
                 existing.category_id = category_id
-                existing.barcode = row.barcode
+                if row.barcode:
+                    existing.barcode = row.barcode
                 existing.unit_cost = row.unit_cost
                 existing.quantity = row.quantity
                 existing.low_stock_threshold = row.low_stock_threshold
@@ -204,3 +238,4 @@ class InventoryService:
                 created += 1
 
         return {"created": created, "updated": updated, "errors": errors}
+

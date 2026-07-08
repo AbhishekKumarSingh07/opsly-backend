@@ -34,7 +34,7 @@ class CategoryResponse(BaseModel):
 
 class InventoryItemCreate(BaseModel):
     part_name: str
-    part_number: str
+    part_number: str | None = None
     category_id: UUID | None = None
     barcode: str | None = None
     unit_cost: Decimal = Decimal("0.00")
@@ -44,6 +44,7 @@ class InventoryItemCreate(BaseModel):
 
 class InventoryItemUpdate(BaseModel):
     part_name: str | None = None
+    part_number: str | None = None
     category_id: UUID | None = None
     barcode: str | None = None
     unit_cost: Decimal | None = None
@@ -56,7 +57,7 @@ class InventoryItemResponse(BaseModel):
 
     id: UUID
     part_name: str
-    part_number: str
+    part_number: str | None
     category_id: UUID | None
     category_name: str | None = None
     barcode: str | None
@@ -69,48 +70,60 @@ class InventoryItemResponse(BaseModel):
     updated_at: datetime
 
 
-# ─── Low Stock Config ────────────────────────────────────────────────────────
+# ─── Inventory Dispatch ───────────────────────────────────────────────────────
 
-class LowStockConfigCreate(BaseModel):
+class InventoryDispatchCreate(BaseModel):
     inventory_item_id: UUID
-    threshold: int
+    ticket_id: UUID
+    quantity: int
+    notes: str | None = None
 
-    @field_validator("threshold")
+    @field_validator("quantity")
     @classmethod
-    def threshold_positive(cls, v: int) -> int:
-        if v < 0:
-            raise ValueError("threshold must be >= 0")
+    def quantity_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("quantity must be > 0")
         return v
 
 
-class LowStockConfigUpdate(BaseModel):
-    threshold: int
+class InventoryDispatchReturn(BaseModel):
+    returned_quantity: int
 
-    @field_validator("threshold")
+    @field_validator("returned_quantity")
     @classmethod
-    def threshold_positive(cls, v: int) -> int:
-        if v < 0:
-            raise ValueError("threshold must be >= 0")
+    def qty_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("returned_quantity must be > 0")
         return v
 
 
-class LowStockConfigResponse(BaseModel):
+class InventoryDispatchResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
-    inventory_item_id: UUID | None
-    part_number: str | None = None
-    part_name: str | None = None
-    threshold: int
-    configured_by: UUID
-    configured_at: datetime
+    inventory_item_id: UUID
+    ticket_id: UUID
+    quantity: int
+    dispatched_by: UUID
+    dispatched_at: datetime
+    part_number_dispatched: str | None
+    barcode_dispatched: str | None
+    notes: str | None
+    returned_quantity: int
+    returned_by: UUID | None
+    returned_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+    # Enriched fields (populated by router)
+    item_name: str | None = None
+    ticket_ref: str | None = None
 
 
 # ─── Bulk Import ─────────────────────────────────────────────────────────────
 
 class BulkImportRow(BaseModel):
     part_name: str
-    part_number: str
+    part_number: str | None = None
     category_name: str | None = None
     barcode: str | None = None
     unit_cost: Decimal = Decimal("0.00")

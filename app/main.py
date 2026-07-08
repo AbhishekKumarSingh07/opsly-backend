@@ -52,7 +52,7 @@ def create_app() -> FastAPI:
             {"name": "Attendance",        "description": "Engineer attendance"},
             {"name": "Inventory",         "description": "Parts & inventory items and stock management"},
             {"name": "Inventory Categories", "description": "Inventory category management"},
-            {"name": "Low Stock Config",  "description": "Per-item low-stock threshold overrides"},
+            {"name": "Inventory Dispatch", "description": "Dispatch items to tickets, track returns"},
             {"name": "Tenders",           "description": "Tender management"},
             {"name": "Expenses",          "description": "Expense claims"},
             {"name": "Uploads",           "description": "File uploads (MinIO)"},
